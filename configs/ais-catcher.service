@@ -1,0 +1,16 @@
+[Unit]
+Description=AIS-catcher Marine VHF Ship Receiver and Web Map (TimescaleDB Backend)
+After=network.target postgresql.service
+Conflicts=readsb.service rtl-433-web.service sdr-voice-web.service rtl-tcp.service soapyremote-server.service
+
+[Service]
+Type=simple
+User=pi
+EnvironmentFile=-/etc/default/sdr-station
+WorkingDirectory=/opt/sdr-station/data/ais
+ExecStart=/usr/local/bin/AIS-catcher -d:0 -gr TUNER auto RTLAGC on BIASTEE off -N PORT 8100 REALTIME on MSG on LOG on DECODER on BACKUP 10 FILE /opt/sdr-station/data/ais/ais_backup.bin STATION "SDR Station" PROME on KML on GEOJSON on -D postgresql:///sdr_station POSITION on STATIC on STATE on STATS on NMEA off INTERVAL 10 RETENTION 14 -S 10110 -q -v 10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=ADS-B TimescaleDB Flight and Position Logger
+After=network.target postgresql.service readsb.service
+
+[Service]
+Type=simple
+User=pi
+EnvironmentFile=-/etc/default/sdr-station
+WorkingDirectory=/opt/sdr-station/adsb-analytics
+ExecStart=/usr/bin/python3 /opt/sdr-station/adsb-analytics/adsb_logger.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

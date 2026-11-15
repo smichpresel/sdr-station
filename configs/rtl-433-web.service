@@ -1,0 +1,15 @@
+[Unit]
+Description=433.92 MHz ISM IoT and Weather Decoder Web UI
+After=network.target
+Conflicts=readsb.service ais-catcher.service sdr-voice-web.service rtl-tcp.service soapyremote-server.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/sdr-station/ism-decoder
+ExecStart=/usr/bin/python3 /opt/sdr-station/ism-decoder/ism_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# Runtime databases, logs, and upstream source/build trees
+data/
+src/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+*.bin
+.DS_Store
