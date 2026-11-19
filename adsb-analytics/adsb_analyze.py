@@ -5,9 +5,9 @@ backed by PostgreSQL 17 + TimescaleDB (dbname=sdr_station).
 
 Provides:
   - Summary metrics & TimescaleDB hypertable chunk statistics
-  - Polar coverage analysis (8 compass sectors)
-  - Top 3 Notable Aircraft of the Day
-    with direct public lookup links (ADS-B Exchange, Planespotters.net, FlightRadar24)
+  - Detection of Russian / Iranian / Sanctioned state & cargo aircraft,
+    Military & Government VIP aircraft, four-engine heavy quadjets, and corporate jets
+  - Direct public lookup links (ADS-B Exchange, OpenSanctions, Planespotters.net, FlightRadar24)
   - CSV export
 """
 
@@ -18,6 +18,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import psycopg2
 import psycopg2.extras
@@ -33,7 +34,49 @@ VIP_BIZJET_TYPES = {
     "FA7X", "FA8X", "F900", "F2TH", "C680", "C68A", "C700", "C750", "E35L",
     "A318", "A319", "A310", "BBJ", "B737",
 }
-QUADJET_RARE_TYPES = {"B744", "B748", "A388", "A343", "A346", "AN12", "IL76", "C17", "C130"}
+QUADJET_RARE_TYPES = {"B744", "B748", "A388", "A343", "A346", "AN12", "IL76", "AN124"}
+
+MILITARY_AIRFRAME_TYPES = {
+    "C17", "C130", "C30J", "A400", "C5M", "K35R", "KC46", "P8", "P3",
+    "E3CF", "E3TF", "E737", "E2", "F15", "F16", "F18", "F35", "EUFI",
+    "RAFL", "SU27", "SU30", "SU35", "MIG29", "TU95", "TU160", "IL78",
+    "V22", "H60", "H47", "AH64", "C295", "CN35", "B703", "U2", "RQ4",
+}
+
+MILITARY_CALLSIGN_PREFIXES = {
+    "RCH": "USAF Air Mobility Command (Reach)",
+    "CNV": "US Navy Logistics (Convoy)",
+    "RRR": "Royal Air Force (Ascot)",
+    "ASCOT": "Royal Air Force Transport",
+    "CFC": "Canadian Armed Forces",
+    "GAF": "German Air Force (Luftwaffe)",
+    "CTM": "French Air & Space Force (Cotam)",
+    "IAM": "Italian Air Force",
+    "RSAF": "Republic of Singapore Air Force",
+    "RMAF": "Royal Malaysian Air Force",
+    "TNI": "Indonesian Air Force (TNI-AU)",
+    "ASY": "Royal Australian Air Force",
+    "KIW": "Royal New Zealand Air Force",
+    "SAM": "USAF Special Air Mission (VIP)",
+    "EXEC": "Government Executive Flight",
+    "NATO": "NATO Operational Flight",
+}
+
+RUSSIAN_IRANIAN_CALLSIGN_PREFIXES = {
+    "RSD": ("Russian State VIP", "Rossiya Special Flight Squadron (Presidential / Government Fleet)"),
+    "RFF": ("Russian Military", "Russian Aerospace Forces (VKS) state transport"),
+    "TTF": ("Russian Military Cargo", "224th Flight Unit (Russian Ministry of Defense cargo)"),
+    "VDA": ("Sanctioned Russian Cargo", "Volga-Dnepr Airlines heavy airlift fleet"),
+    "AZS": ("Sanctioned Russian Cargo", "Aviacon Zitotrans IL-76 cargo fleet (OFAC designated)"),
+    "AFL": ("Russian Flag Carrier", "Aeroflot Russian Airlines"),
+    "SBI": ("Russian Carrier", "S7 Airlines (Siberia Airlines)"),
+    "SVR": ("Russian Carrier", "Ural Airlines"),
+    "IRM": ("Sanctioned Iranian Carrier", "Mahan Air (OFAC / EU sanctioned Iranian carrier)"),
+    "IRA": ("Iranian Flag Carrier", "Iran Air state carrier"),
+    "QFZ": ("Sanctioned Iranian Cargo", "Qeshm Fars Air (sanctioned B747 cargo operator)"),
+    "IRC": ("Iranian Military-Linked", "Saha Airlines (IRIAF-affiliated carrier)"),
+    "IRG": ("Iranian Military Cargo", "Pouya Air (IRGC-linked cargo operator)"),
+}
 
 
 def lookup_aircraft_db(hex_code: str) -> dict:
@@ -67,26 +110,62 @@ def lookup_aircraft_db(hex_code: str) -> dict:
 
 
 def build_aircraft_links(hex_code: str, reg: str = None, callsign: str = None) -> list[dict]:
-    """Generate public aviation lookup URLs for an aircraft."""
+    """Generate public aviation & sanctions lookup URLs for an aircraft."""
     h_low = (hex_code or "").strip().lower()
     h_up = h_low.upper()
+    q_term = reg if (reg and reg != "—") else h_up
     links = [
-        {"label": "ADS-B Exchange ↗", "url": f"https://globe.adsbexchange.com/?icao={h_low}"},
-        {"label": "Planespotters ↗", "url": f"https://www.planespotters.net/hex/{h_up}"},
+        {"label": "ADS-B Exchange", "url": f"https://globe.adsbexchange.com/?icao={h_low}"},
+        {"label": "OpenSanctions", "url": f"https://www.opensanctions.org/search/?q={quote_plus(q_term)}"},
+        {"label": "Planespotters", "url": f"https://www.planespotters.net/hex/{h_up}"},
     ]
     if reg and reg != "—":
-        links.append({"label": f"FR24 ({reg}) ↗", "url": f"https://www.flightradar24.com/data/aircraft/{reg.lower()}"})
+        links.append({"label": f"FR24 ({reg})", "url": f"https://www.flightradar24.com/data/aircraft/{reg.lower()}"})
     elif callsign and callsign != "—":
-        links.append({"label": f"FR24 ({callsign}) ↗", "url": f"https://www.flightradar24.com/data/flights/{callsign.lower()}"})
+        links.append({"label": f"FR24 ({callsign})", "url": f"https://www.flightradar24.com/data/flights/{callsign.lower()}"})
     return links
+
+
+def _classify_icao_block(hex_code: str, reg: str) -> tuple[str | None, str | None]:
+    """Detect Russian, Iranian, DPRK, or Belarus ICAO 24-bit address allocations or registration prefixes."""
+    reg_up = (reg or "").upper().strip()
+    if reg_up.startswith(("RA-", "RF-")):
+        return ("Russian Registry", f"Russian Federation aircraft registration ({reg_up})")
+    if reg_up.startswith("EP-"):
+        return ("Iranian Registry", f"Islamic Republic of Iran aircraft registration ({reg_up})")
+    if reg_up.startswith("P-"):
+        return ("DPRK Registry", f"DPRK state aircraft registration ({reg_up})")
+    if reg_up.startswith("EW-"):
+        return ("Belarus Registry", f"Belarus aircraft registration ({reg_up})")
+
+    try:
+        val = int(hex_code, 16)
+    except ValueError:
+        return (None, None)
+
+    if 0x100000 <= val <= 0x1FFFFF:
+        return ("Russian ICAO Block", f"Russian Federation Mode-S allocation (ICAO {hex_code.upper()})")
+    if 0x730000 <= val <= 0x737FFF:
+        return ("Iranian ICAO Block", f"Iran Mode-S allocation (ICAO {hex_code.upper()})")
+    if 0x720000 <= val <= 0x727FFF:
+        return ("DPRK ICAO Block", f"DPRK Mode-S allocation (ICAO {hex_code.upper()})")
+    if 0x510000 <= val <= 0x5103FF:
+        return ("Belarus ICAO Block", f"Belarus Mode-S allocation (ICAO {hex_code.upper()})")
+    return (None, None)
 
 
 def score_interesting_aircraft(flight_row: dict, meta: dict) -> tuple[int, str, str, str]:
     """
     Returns (score, category_key, badge_text, reason_text) for spotter ranking.
+    Prioritizes:
+      1. Russian / Iranian / Sanctioned state & cargo aircraft (sanctioned_aviation)
+      2. Military, Reconnaissance & Government VIP aircraft (military_gov)
+      3. Heavy Quadjets & Cargo Airlifters (quadjet)
+      4. Long-Range Corporate & VIP Bizjets (bizjet)
+      5. Light General Aviation (light_ga) & Extreme Range (extreme_range)
     """
-    hex_code = (flight_row.get("hex") or "").lower()
-    callsign = (flight_row.get("callsign") or "—").strip()
+    hex_code = (flight_row.get("hex") or "").lower().strip()
+    callsign = (flight_row.get("callsign") or "—").strip().upper()
     reg = meta.get("reg") or "—"
     tcode = (meta.get("type_code") or "").upper()
     tdesc = meta.get("type_desc") or tcode or "Unknown Aircraft"
@@ -96,9 +175,54 @@ def score_interesting_aircraft(flight_row: dict, meta: dict) -> tuple[int, str, 
     min_alt = flight_row.get("min_alt")
     max_alt = flight_row.get("max_alt")
 
+    # 1. Check Russian / Iranian / Sanctioned operators by callsign prefix
+    cs_prefix3 = callsign[:3] if callsign != "—" else ""
+    if cs_prefix3 in RUSSIAN_IRANIAN_CALLSIGN_PREFIXES:
+        badge_lbl, op_desc = RUSSIAN_IRANIAN_CALLSIGN_PREFIXES[cs_prefix3]
+        return (
+            144,
+            "sanctioned_aviation",
+            f"{badge_lbl} · {tcode or 'ICAO ' + hex_code.upper()}",
+            f"{tdesc} ({reg}, flight {callsign}) — {op_desc}, tracked at {min_alt or '—'}–{max_alt or '—'} ft ({max_gs or '—'} kt).",
+        )
+
+    # 2. Check Russian / Iranian / DPRK / Belarus ICAO hex block or registration
+    block_badge, block_desc = _classify_icao_block(hex_code, reg)
+    if block_badge:
+        is_airlifter = tcode in ("IL76", "AN124", "AN12", "B744", "B748", "TU154", "TU204", "IL96")
+        score_val = 142 if is_airlifter else 136
+        return (
+            score_val,
+            "sanctioned_aviation",
+            f"{block_badge} · {tcode or reg}",
+            f"{tdesc} ({reg}, callsign {callsign}) — {block_desc}, tracked at {min_alt or '—'}–{max_alt or '—'} ft.",
+        )
+
+    # 3. Check Military / Reconnaissance / Government VIP (tar1090-db military bit, airframe, or callsign)
+    try:
+        flag_int = int(flags, 16)
+    except ValueError:
+        flag_int = 0
+    is_db_mil = bool(flag_int & 1)
+    mil_op = None
+    for pref, desc in MILITARY_CALLSIGN_PREFIXES.items():
+        if callsign.startswith(pref):
+            mil_op = desc
+            break
+
+    if is_db_mil or (tcode in MILITARY_AIRFRAME_TYPES) or mil_op:
+        role_label = mil_op or ("Military / Gov Registry" if is_db_mil else f"Military {tcode} Airframe")
+        return (
+            128,
+            "military_gov",
+            f"Military / Gov · {tcode or 'Mode-S'}",
+            f"{tdesc} ({reg}, callsign {callsign}) — {role_label}, tracked at {min_alt or '—'}–{max_alt or '—'} ft ({max_gs or '—'} kt).",
+        )
+
+    # 4. Heavy Quadjets & Outsized Cargo (B744, B748, A388, IL76, AN12, AN124)
     if tcode in QUADJET_RARE_TYPES:
-        priority = 104 if tcode in ("B748", "B744", "A388", "AN12", "IL76") else 98
-        badge = "Boeing 747-8i Quadjet" if tcode == "B748" else f"Four-Engine {tcode} Widebody"
+        priority = 110 if tcode in ("B748", "B744", "AN12", "IL76", "AN124") else 102
+        badge = f"Outsized Cargo · {tcode}" if tcode in ("IL76", "AN12", "AN124") else f"Four-Engine Heavy · {tcode}"
         return (
             priority,
             "quadjet",
@@ -106,19 +230,21 @@ def score_interesting_aircraft(flight_row: dict, meta: dict) -> tuple[int, str, 
             f"{tdesc} ({reg}, flight {callsign}) — four-engine heavy aircraft tracked at {min_alt or '—'}–{max_alt or '—'} ft.",
         )
 
+    # 5. Long-Range Corporate & VIP Jets
     if tcode in VIP_BIZJET_TYPES and tcode not in ("A319", "B737", "A310"):
         return (
             96,
             "bizjet",
-            "Long-Range Corporate Jet",
-            f"{tdesc} ({reg}, callsign {callsign}) — business jet tracked at {max_gs} kt.",
+            f"Corporate Jet · {tcode}",
+            f"{tdesc} ({reg}, callsign {callsign}) — long-range corporate jet tracked at {max_gs} kt.",
         )
 
+    # 6. Light General Aviation / Turboprop
     if tcode in ("DA40", "C172", "PA28", "SR22", "AT72", "B350"):
         return (
             88,
             "light_ga",
-            "General Aviation / Turboprop",
+            f"General Aviation · {tcode}",
             f"{tdesc} ({reg}) — low-altitude general aviation flight ({min_alt or '—'} ft, {max_gs or '—'} kt).",
         )
 
@@ -349,7 +475,7 @@ def main():
     print(f"Flight Sessions  : {data['total_flights']}")
     print(f"Max Range (km)   : {data['max_distance_km']}")
     print(f"Max Altitude (ft): {data['max_altitude_ft']}")
-    print("\n--- Top 3 Interesting Aircraft of the Day ---")
+    print("\n--- Top 3 Notable Aircraft of the Day ---")
     for i, p in enumerate(data["top_interesting_planes"], 1):
         print(f"  #{i} [{p['badge']}] {p['callsign']} ({p['reg']} · {p['type_desc']}) — {p['reason']}")
         for lnk in p["links"]:

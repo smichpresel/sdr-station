@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import psycopg2
 import psycopg2.extras
@@ -163,6 +163,20 @@ EXCLUSIVE_MODES = {
 }
 
 MMSI_MID_FLAGS = {
+    "273": ("Russia", "Russian Federation"),
+    "422": ("Iran", "Islamic Republic of Iran"),
+    "445": ("DPRK", "North Korea (DPRK)"),
+    "468": ("Syria", "Syrian Arab Republic"),
+    "775": ("Venezuela", "Venezuela"),
+    "626": ("Gabon", "Gabon (Shadow-Fleet Registry)"),
+    "613": ("Cameroon", "Cameroon (Shadow-Fleet Registry)"),
+    "616": ("Comoros", "Comoros (Shadow-Fleet Registry)"),
+    "511": ("Palau", "Palau (Shadow-Fleet Registry)"),
+    "518": ("Cook Is.", "Cook Islands (Shadow-Fleet Registry)"),
+    "669": ("Eswatini", "Eswatini (Shadow-Fleet Registry)"),
+    "621": ("Djibouti", "Djibouti"),
+    "667": ("Sierra Leone", "Sierra Leone"),
+    "341": ("St. Kitts", "St. Kitts & Nevis"),
     "563": ("Singapore", "Singapore"),
     "564": ("Singapore", "Singapore"),
     "565": ("Singapore", "Singapore"),
@@ -195,6 +209,31 @@ MMSI_MID_FLAGS = {
     "525": ("Indonesia", "Indonesia"),
     "533": ("Malaysia", "Malaysia"),
 }
+
+SANCTIONED_MMSI_WATCHLIST = {
+    "273212000": "OFAC / UK / EU Sanctioned Russian Polar/Subsea Vessel",
+    "273296440": "OFAC / EU Sanctioned Russian-Flagged Tanker Fleet",
+    "273452310": "OFAC Sanctioned Sovcomflot / Russian Tanker",
+    "273355210": "OFAC Sanctioned Russian Crude Carrier",
+    "422263900": "OFAC Sanctioned NITC / IRISL Iranian State Fleet",
+}
+
+SANCTIONED_IMO_WATCHLIST = {
+    "9318539": "OFAC / EU Sanctioned Russian Fleet",
+    "9299721": "OFAC / UK Sanctioned Shadow-Fleet Crude Tanker",
+    "9323326": "OFAC Designated Sanctioned Tanker",
+    "9179842": "OFAC Designated IRISL / NITC Vessel",
+}
+
+SHADOW_FLEET_MIDS = {"626", "613", "616", "511", "518", "669", "621", "667", "341"}
+
+AIS_SECURITY_KEYWORDS = ("ARMED GUARD", "SECURITY", "NO PIRACY", "ESCORT", "CITADEL", "HIGH RISK")
+AIS_DISTRESSED_KEYWORDS = (
+    "DISABLED", "NUC", "NOT UNDER COMMAND", "AGROUND", "DRIFT", "CASUALTY",
+    "FIRE", "MEDEVAC", "MEDICAL", "DISTRESS", "SOS", "MAYDAY", "COLLISION",
+    "TOW", "TOWING", "SALVAGE",
+)
+AIS_NAVAL_KEYWORDS = ("NAVY", "WARSHIP", "COAST GUARD", "PATROL", "MILITARY", "EXERCISE")
 
 
 class CloudflareTunnelManager:
@@ -613,10 +652,15 @@ def get_system_info() -> dict:
     }
 
 
-def build_ship_links(mmsi: int, imo: int = None) -> list[dict]:
-    """Generate public maritime lookup URLs for a vessel."""
+def build_ship_links(mmsi: int, imo: int | None = None, shipname: str | None = None) -> list[dict]:
+    """Generate public maritime & sanctions lookup URLs for a vessel."""
     m = str(mmsi)
+    q_term = str(imo) if imo else (shipname if (shipname and shipname != "—") else m)
     return [
+        {
+            "label": "OpenSanctions",
+            "url": f"https://www.opensanctions.org/search/?q={quote_plus(q_term)}",
+        },
         {
             "label": "VesselFinder",
             "url": f"https://www.vesselfinder.com/vessels/details/{imo if imo else m}",
@@ -633,16 +677,123 @@ def build_ship_links(mmsi: int, imo: int = None) -> list[dict]:
 
 
 def score_interesting_ship(v: dict) -> tuple[int, str, str, str]:
+    """
+    Scores vessels for the Notable Spotter Logbook across:
+      1. Active AIS Emergencies, SAR, Distress, Towing, Armed Security & Spoofing Incidents (ais_incident)
+      2. Sanctioned / Watchlist / Russian / Iranian / DPRK State & Commercial Fleet (sanctioned_vessel)
+      3. High-Risk Shadow-Fleet / Dark-Fleet Crude & Product Tankers (shadow_fleet)
+      4. 400m Ultra-Large Container Ships (megaship_400m) & Deep-Draught VLCC Supertankers (vlcc_supertanker)
+      5. 350m+ Large Vessels (ulcv_350m) & Special / Law Enforcement / Patrol Craft (special_craft)
+    """
     mmsi_str = str(v.get("mmsi", ""))
+    imo_str = str(v.get("imo") or "")
     mid = mmsi_str[:3]
     name = (v.get("shipname") or "—").strip()
     dest = (v.get("destination") or "—").strip()
+    dest_up = dest.upper()
     length_m = int(v.get("len_m") or 0)
     beam_m = int(v.get("beam_m") or 0)
     draught = float(v.get("draught") or 0.0)
+    speed = float(v.get("speed") or 0.0)
     shiptype = int(v.get("shiptype") or 0)
-    flag_short, _ = MMSI_MID_FLAGS.get(mid, ("Vessel", f"MID {mid}"))
+    flag_short, flag_full = MMSI_MID_FLAGS.get(mid, ("Vessel", f"MID {mid}"))
 
+    # 1A. Emergency AIS Beacons (AIS-SART 970, MOB 972, EPIRB 974, SAR Aircraft 111)
+    if mmsi_str.startswith(("970", "972", "974", "111")):
+        beacon_type = (
+            "AIS-SART Survival Craft Beacon" if mmsi_str.startswith("970")
+            else "Man Overboard (MOB) Beacon" if mmsi_str.startswith("972")
+            else "EPIRB Distress Beacon" if mmsi_str.startswith("974")
+            else "VHF SAR Aircraft Transponder"
+        )
+        b_label = name if name != "—" else f"{beacon_type.split()[0]} {mmsi_str}"
+        return (
+            154 if name != "—" else 133,
+            "ais_incident",
+            f"AIS Emergency · {beacon_type}",
+            f"{b_label} (MMSI {mmsi_str}) — active {beacon_type} transmission ({speed} kt).",
+        )
+
+    # 1B. Distress / Casualty / Towing / Disabled / Fire / Medevac keywords in AIS destination
+    for kw in AIS_DISTRESSED_KEYWORDS:
+        if kw in dest_up:
+            return (
+                152,
+                "ais_incident",
+                f"AIS Incident · {kw.title()} ({flag_short})",
+                f"{name} (MMSI {mmsi_str}, {length_m}m) — AIS destination reports '{dest}' at {speed} kt.",
+            )
+
+    # 1C. Armed Security / Anti-Piracy / High-Risk Transit Broadcasts in AIS destination
+    for kw in AIS_SECURITY_KEYWORDS:
+        if kw in dest_up:
+            return (
+                138,
+                "ais_incident",
+                f"Security Alert · Armed Guards ({flag_short})",
+                f"{name} (MMSI {mmsi_str}, {length_m}m) — vessel broadcasting security status '{dest}' ({speed} kt).",
+            )
+
+    # 1D. Naval / Coast Guard / High-Speed SAR & Law Enforcement Intercepts over AIS
+    for kw in AIS_NAVAL_KEYWORDS:
+        if kw in dest_up or kw in name.upper():
+            return (
+                135,
+                "ais_incident",
+                f"Naval / Patrol Op ({flag_short})",
+                f"{name} (MMSI {mmsi_str}) — military/patrol broadcast (dest: '{dest}', {speed} kt).",
+            )
+
+    if shiptype in (51, 55, 58) and speed >= 14.0:
+        role = "Law Enforcement Intercept" if shiptype == 55 else ("SAR High-Speed Response" if shiptype == 51 else "Medical Dispatch")
+        return (
+            134,
+            "ais_incident",
+            f"AIS Incident · {role} ({speed} kt)",
+            f"{name} (MMSI {mmsi_str}, {flag_short}) — operating at {speed} kt (dest: '{dest}').",
+        )
+
+    # 1E. AIS Kinematics / GPS Spoofing Anomaly (surface vessel > 48 kt outside HSC/WIG)
+    if speed >= 48.0 and not (40 <= shiptype <= 49) and not mmsi_str.startswith("111"):
+        return (
+            136,
+            "ais_incident",
+            f"AIS Spoofing / Speed Anomaly ({speed} kt)",
+            f"{name} (MMSI {mmsi_str}, {flag_short}) — anomalous surface speed {speed} kt reported over AIS.",
+        )
+
+    # 2A. Explicit OFAC / EU / UK Sanctioned Vessel Watchlist (MMSI or IMO)
+    if mmsi_str in SANCTIONED_MMSI_WATCHLIST or imo_str in SANCTIONED_IMO_WATCHLIST:
+        note = SANCTIONED_MMSI_WATCHLIST.get(mmsi_str) or SANCTIONED_IMO_WATCHLIST.get(imo_str)
+        return (
+            155,
+            "sanctioned_vessel",
+            f"Sanctioned Watchlist · {flag_short}",
+            f"{name} (MMSI {mmsi_str}{', IMO ' + imo_str if imo_str else ''}) — {note}, dest: '{dest}'.",
+        )
+
+    # 2B. Russian (MID 273), Iranian (MID 422), DPRK (MID 445), Syrian (MID 468), Venezuelan (MID 775) Flagged Vessels
+    if mid in ("273", "422", "445", "468", "775"):
+        return (
+            146,
+            "sanctioned_vessel",
+            f"Sanctioned / Watchlist Flag · {flag_short} (MID {mid})",
+            f"{name} (MMSI {mmsi_str}{', IMO ' + imo_str if imo_str else ''}) — {flag_full} maritime registry ({length_m}m × {beam_m}m, {draught}m draught), dest: '{dest}'.",
+        )
+
+    # 3. High-Risk Shadow-Fleet / Dark-Fleet Tankers (flag-hopping registries + crude/product tankers orSTS/OPL orders)
+    is_tanker = 80 <= shiptype <= 89
+    is_obfuscated_orders = dest_up in ("FOR ORDERS", "FOR ORDER", "ORDERS", "OPL", "STS", "TBN", "HIGH SEA")
+    if (mid in SHADOW_FLEET_MIDS and (is_tanker or length_m >= 180)) or (is_tanker and length_m >= 240 and is_obfuscated_orders):
+        reason_tag = f"{flag_full} tanker registry" if mid in SHADOW_FLEET_MIDS else f"Tanker broadcasting '{dest}' orders"
+        return (
+            131,
+            "shadow_fleet",
+            f"Shadow-Fleet Watch · {flag_short} ({length_m or '—'}m)",
+            f"{name} (MMSI {mmsi_str}{', IMO ' + imo_str if imo_str else ''}) — {reason_tag} ({draught}m draught, {speed} kt), dest: '{dest}'.",
+        )
+
+    # 4. 400m Ultra-Large Container Ships (ULCS)
     if length_m >= 395:
         return (
             125 + (1 if draught >= 15.5 else 0),
@@ -651,14 +802,16 @@ def score_interesting_ship(v: dict) -> tuple[int, str, str, str]:
             f"{name} (IMO {v.get('imo') or '—'}) — 400m-class container vessel ({draught}m draught), dest: '{dest}'.",
         )
 
-    if (80 <= shiptype <= 89 and draught >= 19.0) or (draught >= 20.0 and length_m >= 300):
+    # 5. Deep-Draught VLCC Supertankers
+    if (is_tanker and draught >= 19.0) or (draught >= 20.0 and length_m >= 300):
         return (
             112,
             "vlcc_supertanker",
-            f"Deep-Draught Tanker ({draught}m · {flag_short})",
-            f"{name} ({length_m}m × {beam_m}m) — deep-draught tanker drawing {draught}m, dest: '{dest}'.",
+            f"Deep-Draught VLCC ({draught}m · {flag_short})",
+            f"{name} ({length_m}m × {beam_m}m) — deep-draught supertanker drawing {draught}m, dest: '{dest}'.",
         )
 
+    # 6. 350m+ Large Vessels
     if length_m >= 350:
         return (
             102,
@@ -667,13 +820,19 @@ def score_interesting_ship(v: dict) -> tuple[int, str, str, str]:
             f"{name} (IMO {v.get('imo') or '—'}) — {length_m}m × {beam_m}m vessel ({draught}m draught), dest: '{dest}'.",
         )
 
-    if shiptype in (51, 55) or (shiptype == 37 and length_m >= 50):
-        badge_lbl = "Patrol Craft" if shiptype == 55 else ("SAR Craft" if shiptype == 51 else f"{length_m}m Yacht")
+    # 7. Special Craft (SAR, Law Enforcement, Towing, Superyachts)
+    if shiptype in (51, 55, 31, 32) or (shiptype == 37 and length_m >= 50):
+        badge_lbl = (
+            "Law Enforcement / Patrol" if shiptype == 55
+            else "Search & Rescue" if shiptype == 51
+            else "Ocean Towing" if shiptype in (31, 32)
+            else f"{length_m}m Superyacht"
+        )
         return (
             94,
             "special_craft",
             f"{badge_lbl} ({flag_short})",
-            f"{name} (MMSI {mmsi_str}) — special-purpose vessel ({length_m}m), dest: '{dest}'.",
+            f"{name} (MMSI {mmsi_str}) — special-purpose vessel ({length_m}m, {speed} kt), dest: '{dest}'.",
         )
 
     return (
@@ -736,18 +895,19 @@ def get_ais_summary() -> dict:
                 d["dist_km"] = haversine_km(STATION_LAT, STATION_LON, d["lat"], d["lon"])
             else:
                 d["dist_km"] = None
-            d["links"] = build_ship_links(d["mmsi"], d.get("imo"))
+            d["links"] = build_ship_links(d["mmsi"], d.get("imo"), d.get("shipname"))
             all_vessels.append(d)
 
-            if d["shipname"] and d["shipname"] != "—":
-                score, cat_key, badge, reason = score_interesting_ship(d)
+            score, cat_key, badge, reason = score_interesting_ship(d)
+            if (d["shipname"] and d["shipname"] != "—") or cat_key in ("sanctioned_vessel", "shadow_fleet", "ais_incident"):
+                disp_name = d["shipname"] if (d["shipname"] and d["shipname"] != "—") else f"MMSI {d['mmsi']}"
                 ship_entry = {
                     "score": score,
                     "cat_key": cat_key,
                     "badge": badge,
                     "reason": reason,
                     "mmsi": d["mmsi"],
-                    "shipname": d["shipname"],
+                    "shipname": disp_name,
                     "imo": d["imo"],
                     "len_m": d["len_m"],
                     "beam_m": d["beam_m"],
@@ -766,7 +926,7 @@ def get_ais_summary() -> dict:
                         {
                             "domain": "ship",
                             "target_id": str(d["mmsi"]),
-                            "name_or_reg": d["shipname"],
+                            "name_or_reg": disp_name,
                             "secondary_id": f"IMO {d['imo']}" if d.get("imo") else f"MMSI {d['mmsi']}",
                             "category_key": cat_key,
                             "badge": badge,
@@ -966,8 +1126,8 @@ def get_combined_map_and_log() -> dict:
             for r in ship_rows:
                 d = dict(r)
                 score, cat_key, badge, reason = score_interesting_ship(d)
-                is_int = score >= 90 and d["shipname"] != "—"
-                links = build_ship_links(d["mmsi"], d.get("imo"))
+                is_int = score >= 90 and (d["shipname"] != "—" or cat_key in ("sanctioned_vessel", "shadow_fleet", "ais_incident"))
+                links = build_ship_links(d["mmsi"], d.get("imo"), d.get("shipname"))
                 dist_km = (
                     haversine_km(STATION_LAT, STATION_LON, d["lat"], d["lon"])
                     if (STATION_LAT is not None and STATION_LON is not None)
@@ -1015,7 +1175,13 @@ def get_combined_map_and_log() -> dict:
                     metric_summary, links_json,
                     first_seen, last_seen
                 FROM spotter_highlights
-                WHERE category_key IN ('megaship_400m', 'vlcc_supertanker', 'ulcv_350m', 'special_craft', 'notable_registry', 'bizjet', 'quadjet', 'light_ga', 'extreme_range')
+                WHERE category_key IN (
+                    'ais_incident', 'sanctioned_vessel', 'shadow_fleet',
+                    'sanctioned_aviation', 'military_gov',
+                    'megaship_400m', 'vlcc_supertanker', 'ulcv_350m',
+                    'special_craft', 'notable_registry', 'bizjet',
+                    'quadjet', 'light_ga', 'extreme_range'
+                )
                 ORDER BY score DESC, last_seen DESC
                 LIMIT 150
                 """
@@ -1766,6 +1932,8 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="segmented" role="tablist" aria-label="Map layer filter">
             <button class="seg-btn active" id="fltAll" onclick="setMapFilter('all')">All Traffic</button>
             <button class="seg-btn" id="fltHighlights" onclick="setMapFilter('highlights')">Notable Only</button>
+            <button class="seg-btn" id="fltSanctioned" onclick="setMapFilter('sanctioned')">Sanctioned &amp; Military</button>
+            <button class="seg-btn" id="fltIncidents" onclick="setMapFilter('incidents')">AIS Incidents</button>
             <button class="seg-btn" id="fltShips" onclick="setMapFilter('ships')">Vessels</button>
             <button class="seg-btn" id="fltPlanes" onclick="setMapFilter('planes')">Aircraft</button>
           </div>
@@ -1834,6 +2002,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap">
         <div class="segmented" id="logSubFilters">
           <button class="seg-btn active" id="logFltAll" onclick="setLogFilter('all')">All</button>
+          <button class="seg-btn" id="logFltSanctioned" onclick="setLogFilter('sanctioned')">Sanctioned &amp; Shadow Fleet</button>
+          <button class="seg-btn" id="logFltMilitary" onclick="setLogFilter('military')">RU / IR / Military Air</button>
+          <button class="seg-btn" id="logFltIncidents" onclick="setLogFilter('incidents')">AIS Incidents</button>
           <button class="seg-btn" id="logFltShip" onclick="setLogFilter('ship')">Ships</button>
           <button class="seg-btn" id="logFltAircraft" onclick="setLogFilter('aircraft')">Aircraft</button>
           <button class="seg-btn" id="logFltNotable" onclick="setLogFilter('notable')">400m ULCS &amp; Quadjets</button>
@@ -1939,9 +2110,11 @@ function renderCombinedMap() {
   const topShipIds = new Set(
     ships.filter(s => s.is_interesting).sort((a, b) => b.score - a.score).slice(0, 5).map(s => s.id)
   );
-  if (currentMapFilter === 'all' || currentMapFilter === 'ships' || currentMapFilter === 'highlights') {
+  if (['all', 'ships', 'highlights', 'sanctioned', 'incidents'].includes(currentMapFilter)) {
     ships.forEach(s => {
       if (currentMapFilter === 'highlights' && !s.is_interesting) return;
+      if (currentMapFilter === 'sanctioned' && !['sanctioned_vessel', 'shadow_fleet'].includes(s.cat_key)) return;
+      if (currentMapFilter === 'incidents' && s.cat_key !== 'ais_incident') return;
       shownShips++;
       if (s.is_interesting) hiCount++;
 
@@ -1984,9 +2157,10 @@ function renderCombinedMap() {
   const topPlaneIds = new Set(
     planes.filter(p => p.is_interesting).sort((a, b) => b.score - a.score).slice(0, 5).map(p => p.id)
   );
-  if (currentMapFilter === 'all' || currentMapFilter === 'planes' || currentMapFilter === 'highlights') {
+  if (['all', 'planes', 'highlights', 'sanctioned'].includes(currentMapFilter)) {
     planes.forEach(p => {
       if (currentMapFilter === 'highlights' && !p.is_interesting) return;
+      if (currentMapFilter === 'sanctioned' && !['sanctioned_aviation', 'military_gov'].includes(p.cat_key)) return;
       shownPlanes++;
       if (p.is_interesting) hiCount++;
 
@@ -2033,7 +2207,7 @@ function renderCombinedMap() {
 
 function setMapFilter(flt) {
   currentMapFilter = flt;
-  ['All', 'Highlights', 'Ships', 'Planes'].forEach(k => {
+  ['All', 'Highlights', 'Sanctioned', 'Incidents', 'Ships', 'Planes'].forEach(k => {
     const el = document.getElementById('flt' + k);
     if (el) el.classList.toggle('active', k.toLowerCase() === flt);
   });
@@ -2078,6 +2252,9 @@ function switchTableTab(tab) {
 function setLogFilter(flt) {
   currentLogFilter = flt;
   document.getElementById('logFltAll').classList.toggle('active', flt === 'all');
+  document.getElementById('logFltSanctioned').classList.toggle('active', flt === 'sanctioned');
+  document.getElementById('logFltMilitary').classList.toggle('active', flt === 'military');
+  document.getElementById('logFltIncidents').classList.toggle('active', flt === 'incidents');
   document.getElementById('logFltShip').classList.toggle('active', flt === 'ship');
   document.getElementById('logFltAircraft').classList.toggle('active', flt === 'aircraft');
   document.getElementById('logFltNotable').classList.toggle('active', flt === 'notable');
@@ -2102,6 +2279,9 @@ function renderActiveTable() {
     `;
     const rows = cachedMapData.highlights_log || [];
     const filtered = rows.filter(r => {
+      if (currentLogFilter === 'sanctioned' && !['sanctioned_vessel', 'shadow_fleet', 'sanctioned_aviation'].includes(r.category_key)) return false;
+      if (currentLogFilter === 'military' && !['sanctioned_aviation', 'military_gov'].includes(r.category_key)) return false;
+      if (currentLogFilter === 'incidents' && r.category_key !== 'ais_incident') return false;
       if (currentLogFilter === 'ship' && r.domain !== 'ship') return false;
       if (currentLogFilter === 'aircraft' && r.domain !== 'aircraft') return false;
       if (currentLogFilter === 'notable' && !['megaship_400m', 'quadjet', 'bizjet', 'vlcc_supertanker'].includes(r.category_key)) return false;
