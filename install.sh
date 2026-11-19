@@ -24,6 +24,14 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   postgresql-17 postgresql-client-17 postgresql-17-timescaledb libpq-dev python3-psycopg2 \
   ffmpeg sox libsox-fmt-all jq curl lighttpd
 
+# Install cloudflared for zero-account temporary TryCloudflare tunnels (if not already present)
+if ! command -v cloudflared >/dev/null 2>&1; then
+  ARCH="$(dpkg --print-architecture)"
+  echo "=== Installing cloudflared (${ARCH}) for Quick Tunnels ==="
+  curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb" -o /tmp/cloudflared.deb && \
+    sudo dpkg -i /tmp/cloudflared.deb && rm -f /tmp/cloudflared.deb || true
+fi
+
 sudo cp "${REPO_DIR}/configs/blacklist-rtlsdr.conf" /etc/modprobe.d/blacklist-rtlsdr.conf
 sudo rmmod rtl2832_sdr dvb_usb_rtl28xxu rtl2832 dvb_usb_v2 dvb_core 2>/dev/null || true
 sudo usermod -aG plugdev "${RUN_USER}" || true

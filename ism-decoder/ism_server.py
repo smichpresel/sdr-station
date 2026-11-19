@@ -2,8 +2,7 @@
 """
 433.92 MHz / ISM Band Sensor & Telemetry Decoder Web UI (rtl_433).
 Decodes wireless weather stations, automotive tire pressure sensors (TPMS),
-doorbells, security sensors, and utility meters, logging to JSONL and serving
-a real-time web interface on port 8433.
+and utility telemetry on port 8433.
 """
 
 import json
@@ -96,42 +95,71 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SDR Station — 433.92 MHz ISM / Weather / TPMS Decoder</title>
+<title>433.92 MHz ISM Telemetry Decoder</title>
 <style>
-  :root { --bg: #0b101b; --card: #131c2e; --border: #23324d; --text: #e2e8f0; --muted: #94a3b8; --accent: #a855f7; }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px; }
-  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 20px; }
-  h1 { margin: 0; font-size: 1.35rem; }
-  .back-btn { color: #38bdf8; text-decoration: none; font-size: 0.9rem; border: 1px solid var(--border); padding: 6px 12px; border-radius: 8px; background: var(--card); }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 18px; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; }
-  pre { margin: 0; font-family: monospace; font-size: 0.8rem; color: #cbd5e1; white-space: pre-wrap; word-break: break-all; }
+  @layer base, tokens, layout, components;
+  @layer tokens {
+    :root {
+      color-scheme: dark;
+      --canvas: oklch(0.13 0.006 255);
+      --surface: oklch(0.16 0.007 255);
+      --surface-raised: oklch(0.19 0.009 255);
+      --surface-well: oklch(0.115 0.005 255);
+      --line: oklch(1 0 0 / 0.08);
+      --line-strong: oklch(1 0 0 / 0.15);
+      --ink-strong: oklch(0.95 0.004 255);
+      --ink: oklch(0.83 0.008 255);
+      --ink-muted: oklch(0.62 0.012 255);
+      --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      --radius-sm: 5px;
+      --radius-lg: 10px;
+    }
+  }
+  @layer base {
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--font-sans); font-size: 0.875rem; line-height: 1.5; background: var(--canvas); color: var(--ink); }
+    .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    a { color: inherit; text-decoration: none; }
+  }
+  @layer layout {
+    .shell { max-inline-size: 1080px; margin-inline: auto; padding-inline: 1.5rem; padding-block-end: 3rem; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; padding-block: 0.85rem; border-block-end: 1px solid var(--line); margin-block-end: 1.25rem; }
+    .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); overflow: clip; margin-block-end: 1.25rem; }
+    .panel-bar { padding: 0.65rem 0.9rem; border-block-end: 1px solid var(--line); font-size: 0.82rem; font-weight: 600; color: var(--ink-strong); }
+  }
+  @layer components {
+    .btn { min-block-size: 2rem; padding: 0.3rem 0.75rem; border-radius: var(--radius-sm); border: 1px solid var(--line-strong); background: var(--surface-raised); color: var(--ink-strong); font-size: 0.78rem; font-weight: 500; }
+    table { inline-size: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th, td { text-align: start; padding: 0.55rem 0.85rem; border-block-end: 1px solid var(--line); }
+    th { background: var(--surface-well); color: var(--ink-muted); font-size: 0.72rem; font-weight: 500; }
+    pre { margin: 0; font-family: var(--font-mono); font-size: 0.74rem; color: var(--ink); white-space: pre-wrap; word-break: break-all; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>📡 433.92 MHz ISM & Sensor Decoder (rtl_433)</h1>
-    <a class="back-btn" id="hubLink" href="/">← Back to Station Launcher</a>
+<div class="shell">
+  <header class="topbar">
+    <div style="display:flex;align-items:baseline;gap:0.75rem">
+      <strong style="font-size:0.95rem;color:var(--ink-strong)">433.92 MHz ISM Telemetry Decoder</strong>
+      <span style="font-size:0.76rem;color:var(--ink-muted)">rtl_433 v25.02 · JSONL Logger</span>
+    </div>
+    <a class="btn" id="hubLink" href="/">Back to Console</a>
   </header>
-  <div class="card">
-    <h3 style="margin-top:0">Discovered Wireless Devices & Sensors</h3>
+  <section class="panel">
+    <div class="panel-bar">Discovered Wireless Devices &amp; Sensors</div>
     <table>
-      <thead><tr><th>Model</th><th>ID / Ch</th><th>Packets</th><th>Last Seen (UTC)</th><th>Latest Telemetry</th></tr></thead>
-      <tbody id="devBody"><tr><td colspan="5">Listening on 433.92 MHz for weather stations, TPMS tire sensors, remotes...</td></tr></tbody>
+      <thead><tr><th>Model</th><th>ID / Channel</th><th>Packets</th><th>Last Seen (UTC)</th><th>Latest Telemetry</th></tr></thead>
+      <tbody id="devBody"><tr><td colspan="5" style="color:var(--ink-muted)">Listening on 433.92 MHz for weather stations, TPMS sensors, and utility telemetry...</td></tr></tbody>
     </table>
-  </div>
-  <div class="card">
-    <h3 style="margin-top:0">Live Packet Feed</h3>
+  </section>
+  <section class="panel">
+    <div class="panel-bar">Live Packet Stream</div>
     <table>
       <thead><tr><th>UTC Time</th><th>Model</th><th>Payload JSON</th></tr></thead>
       <tbody id="evBody"></tbody>
     </table>
-  </div>
+  </section>
 </div>
 <script>
 document.getElementById('hubLink').href = 'http://' + window.location.hostname + ':8080/';
@@ -143,10 +171,10 @@ async function refresh() {
   if (devs.length > 0) {
     devBody.innerHTML = devs.map(d => `
       <tr>
-        <td><b>${d.model}</b></td>
-        <td>${d.id}</td>
-        <td>${d.count}</td>
-        <td>${d.last_seen}</td>
+        <td style="font-weight:600;color:var(--ink-strong)">${d.model}</td>
+        <td class="num">${d.id}</td>
+        <td class="num">${d.count}</td>
+        <td class="num" style="color:var(--ink-muted)">${d.last_seen}</td>
         <td><pre>${JSON.stringify(d.last_data)}</pre></td>
       </tr>
     `).join('');
@@ -154,8 +182,8 @@ async function refresh() {
   const evBody = document.getElementById('evBody');
   evBody.innerHTML = data.recent.slice(0, 40).map(e => `
     <tr>
-      <td style="white-space:nowrap">${e.time || ''}</td>
-      <td><b>${e.model || ''}</b></td>
+      <td class="num" style="white-space:nowrap;color:var(--ink-muted)">${e.time || ''}</td>
+      <td style="font-weight:600;color:var(--ink-strong)">${e.model || ''}</td>
       <td><pre>${JSON.stringify(e)}</pre></td>
     </tr>
   `).join('');

@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-SDR Station — Web Launcher, Dual-Band Auto-Cycler, Combined Air/Sea Map & Notable Catch Portal.
+SDR Station — Web Control Plane, Dual-Band Cycler, Cloudflare Quick Tunnel & Radar Hub.
 Database Engine: PostgreSQL 17 + TimescaleDB 2.19 (dbname=sdr_station)
 
 Features:
-  1. Overview of installed SDR receivers with descriptions, frequencies, and ports
-  2. Selectable ADS-B / Marine AIS Auto-Cycler (default 2 min each) + Manual Mode Switcher
-  3. Interactive Combined Air & Sea Map (Leaflet) showing aircraft and vessels
-     with callout markers for notable vessels and aircraft
-  4. "Notable Catches of the Day" (Top 3 Aircraft & Top 3 Ships) + Persistent
-     "Spotter Logbook" (spotter_highlights table in TimescaleDB)
-  5. TimescaleDB Hypertable Analytics & CSV Export
+  1. Hardware receiver multiplexer & selectable ADS-B / Marine AIS Auto-Cycler
+  2. Built-in Cloudflare Quick Tunnel manager (cloudflared tunnel --url, no account needed)
+  3. Combined Air & Sea Map (Leaflet) with notable vessel & aircraft callouts
+  4. Notable Catches of the Day + Persistent Spotter Logbook (spotter_highlights)
+  5. TimescaleDB Hypertable Analytics & CSV Exports
 """
 
 import csv
@@ -18,6 +16,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -76,90 +75,89 @@ EXCLUSIVE_MODES = {
         "service": "readsb.service",
         "title": "ADS-B Aircraft Radar",
         "badge": "1090 MHz · Mode-S",
-        "icon": "ADS-B",
+        "icon": "adsb",
         "port": 8504,
         "path": "/tar1090/",
-        "PortLabel": "Port 8504 / /tar1090 + TCP 30002/30003/30005",
-        "stack": "readsb v3.16 + tar1090 + adsb-logger (TimescaleDB)",
+        "PortLabel": ":8504 / /tar1090 · TCP 30002–30005",
+        "stack": "readsb v3.16 + tar1090 + adsb-logger",
         "description": (
-            "Decodes 1090 MHz Mode-S and ADS-B aircraft transponders in real time. "
-            "Serves the tar1090 aviation radar interface and logs flight positions into "
-            "TimescaleDB hypertables."
+            "Real-time 1090 MHz Mode-S and ADS-B transponder demodulator. "
+            "Serves the tar1090 radar display and logs flight positions into TimescaleDB."
         ),
     },
     "ais": {
         "id": "ais",
         "service": "ais-catcher.service",
-        "title": "Marine AIS Ship Radar",
+        "title": "Marine AIS Receiver",
         "badge": "161.975 / 162.025 MHz",
-        "icon": "AIS",
+        "icon": "ais",
         "port": 8100,
         "path": "/",
-        "PortLabel": "Port 8100 (Web Map) + TCP 10110 (NMEA)",
-        "stack": "AIS-catcher v0.70 + TimescaleDB (libpq) + NMEA Server",
+        "PortLabel": ":8100 (Web Map) · TCP 10110 (NMEA)",
+        "stack": "AIS-catcher v0.70 + TimescaleDB (libpq)",
         "description": (
-            "Dual-channel VHF marine AIS receiver tracking vessel positions and static voyage data. "
-            "Streams decoded messages into PostgreSQL 17 / TimescaleDB with 14-day chunk retention."
+            "Dual-channel VHF maritime AIS GMSK receiver tracking vessel positions and static "
+            "voyage reports into PostgreSQL 17 / TimescaleDB."
         ),
     },
     "voice": {
         "id": "voice",
         "service": "sdr-voice-web.service",
-        "title": "VHF / FM Voice Receiver",
+        "title": "VHF / FM Audio Receiver",
         "badge": "88 – 163 MHz · AM / NFM / WFM",
-        "icon": "Audio",
+        "icon": "voice",
         "port": 8073,
         "path": "/",
-        "PortLabel": "Port 8073 (Web Tuner & MP3 Stream)",
-        "stack": "rtl_fm + FFmpeg MP3 Streamer + Scanner",
+        "PortLabel": ":8073 (Web Tuner & /stream.mp3)",
+        "stack": "rtl_fm + FFmpeg MP3 Streamer",
         "description": (
-            "Browser-accessible AM, NFM, and WFM demodulator and frequency scanner streaming "
-            "HTTP MP3 audio. Check local regulations before receiving or recording voice traffic."
+            "Browser-streamed AM, NFM, and WFM demodulator and frequency scanner. "
+            "Check local regulations before receiving or recording voice traffic."
         ),
     },
     "ism": {
         "id": "ism",
         "service": "rtl-433-web.service",
-        "title": "433.92 MHz ISM Sensor Decoder",
+        "title": "433.92 MHz ISM Decoder",
         "badge": "433.92 MHz · OOK / FSK",
-        "icon": "ISM",
+        "icon": "ism",
         "port": 8433,
         "path": "/",
-        "PortLabel": "Port 8433 (Sensor Feed & JSONL Logger)",
-        "stack": "rtl_433 v25.02 + Web Telemetry Monitor",
+        "PortLabel": ":8433 (Packet Feed & JSONL)",
+        "stack": "rtl_433 v25.02 + Web Monitor",
         "description": (
-            "Decodes wireless sensor protocols on the 433.92 MHz ISM band, including weather "
-            "stations, tire pressure monitoring sensors (TPMS), and utility telemetry."
+            "Decodes wireless sensor protocols on 433.92 MHz including weather stations, "
+            "tire pressure sensors (TPMS), and utility telemetry."
         ),
     },
     "rtltcp": {
         "id": "rtltcp",
         "service": "rtl-tcp.service",
-        "title": "Remote Raw I/Q Server (rtl_tcp)",
-        "badge": "24 – 1766 MHz · Raw I/Q",
-        "icon": "I/Q",
+        "title": "Raw I/Q Server (rtl_tcp)",
+        "badge": "24 – 1766 MHz · 8-bit I/Q",
+        "icon": "iq",
         "port": 1234,
         "path": None,
-        "PortLabel": "TCP Port 1234 (rtl_tcp protocol)",
+        "PortLabel": "TCP :1234 (rtl_tcp)",
         "stack": "rtl_tcp (0.0.0.0:1234)",
         "description": (
-            "Streams raw I/Q samples over TCP port 1234 for desktop SDR clients (SDR++, Gqrx) "
-            "and mobile SDR applications over LAN or Tailscale."
+            "Streams raw baseband I/Q samples over TCP port 1234 for desktop waterfall clients "
+            "(SDR++, Gqrx) and mobile applications."
         ),
     },
     "soapy": {
         "id": "soapy",
         "service": "soapyremote-server.service",
-        "title": "SoapySDR Remote Network Server",
+        "title": "SoapySDR Remote Server",
         "badge": "24 – 1766 MHz · SoapyRemote",
-        "icon": "Soapy",
+        "icon": "soapy",
         "port": 55132,
         "path": None,
-        "PortLabel": "TCP/UDP Port 55132 (SoapySDRRemote)",
+        "PortLabel": "TCP/UDP :55132 (SoapySDR)",
         "stack": "SoapySDRServer (0.8)",
         "description": (
             "Exposes the RTL-SDR v5 over the SoapySDRRemote network protocol for "
-            "CubicSDR, GNU Radio, SatDump, and Python SoapySDR scripts."
+            "CubicSDR, GNU Radio, SatDump, and Python scripts."
         ),
     },
 }
@@ -197,6 +195,118 @@ MMSI_MID_FLAGS = {
     "525": ("Indonesia", "Indonesia"),
     "533": ("Malaysia", "Malaysia"),
 }
+
+
+class CloudflareTunnelManager:
+    """
+    Manages a temporary, account-free Cloudflare Quick Tunnel (`cloudflared tunnel --url http://127.0.0.1:<port>`).
+    Generates a public `https://<words>.trycloudflare.com` share link on demand.
+    """
+
+    URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.target_port = PORT
+        self.public_url = None
+        self.status_text = "Idle"
+        self.started_at = None
+
+    def _find_binary(self) -> str | None:
+        for candidate in (shutil.which("cloudflared"), "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"):
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+    def start(self, target_port: int = PORT) -> dict:
+        with self.lock:
+            self._stop_locked()
+            bin_path = self._find_binary()
+            if not bin_path:
+                self.status_text = "cloudflared not installed (run ./install.sh)"
+                return self.status()
+
+            self.target_port = int(target_port or PORT)
+            self.public_url = None
+            self.status_text = "Requesting trycloudflare.com edge URL..."
+            self.started_at = time.time()
+            self.proc = subprocess.Popen(
+                [
+                    bin_path,
+                    "tunnel",
+                    "--no-autoupdate",
+                    "--url",
+                    f"http://127.0.0.1:{self.target_port}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            t = threading.Thread(target=self._watch_output, args=(self.proc,), daemon=True)
+            t.start()
+
+        # Wait up to 4.5s for the URL to appear so the immediate API response can return it
+        deadline = time.time() + 4.5
+        while time.time() < deadline:
+            with self.lock:
+                if self.public_url or (self.proc and self.proc.poll() is not None):
+                    break
+            time.sleep(0.2)
+        return self.status()
+
+    def _watch_output(self, proc: subprocess.Popen):
+        try:
+            for line in proc.stdout:
+                m = self.URL_RE.search(line)
+                if m:
+                    with self.lock:
+                        if self.proc is proc:
+                            self.public_url = m.group(0)
+                            self.status_text = "Active"
+        except Exception:
+            pass
+        finally:
+            with self.lock:
+                if self.proc is proc and proc.poll() is not None:
+                    self.public_url = None
+                    self.status_text = "Stopped"
+
+    def _stop_locked(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        self.proc = None
+        self.public_url = None
+        self.status_text = "Idle"
+        self.started_at = None
+
+    def stop(self) -> dict:
+        with self.lock:
+            self._stop_locked()
+            return self.status()
+
+    def status(self) -> dict:
+        with self.lock:
+            running = self.proc is not None and self.proc.poll() is None
+            if not running and self.status_text == "Active":
+                self.status_text = "Stopped"
+                self.public_url = None
+            return {
+                "installed": bool(self._find_binary()),
+                "enabled": running,
+                "port": self.target_port,
+                "url": self.public_url,
+                "status": self.status_text,
+                "uptime_sec": int(time.time() - self.started_at) if (running and self.started_at) else None,
+            }
 
 
 def init_spotter_db():
@@ -438,6 +548,7 @@ class DualBandCycler:
 
 init_spotter_db()
 CYCLER = DualBandCycler()
+TUNNEL = CloudflareTunnelManager()
 
 
 def activate_mode(mode_id: str) -> dict:
@@ -473,7 +584,7 @@ def get_system_info() -> dict:
             tailscale_auth_url = ts_json.get("AuthURL") or None
         except Exception:
             pass
-    tailscale_status = "Connected" if tailscale_ip else "Click to Authenticate"
+    tailscale_status = "Connected" if tailscale_ip else "Not Connected"
 
     active_mode = "off"
     modes_status = {}
@@ -485,7 +596,7 @@ def get_system_info() -> dict:
 
     return {
         "station_name": STATION_NAME,
-        "usb_sdr": "Nooelec NESDR SMArt v5 (RTL2832U / R820T2)" if usb_connected else "Not detected on USB",
+        "usb_sdr": "Nooelec NESDR SMArt v5" if usb_connected else "Not detected",
         "usb_connected": usb_connected,
         "cpu_temp_c": temp_c,
         "load_1m": round(load_avg[0], 2),
@@ -498,6 +609,7 @@ def get_system_info() -> dict:
         "active_mode": active_mode,
         "modes_status": modes_status,
         "cycler": CYCLER.status(),
+        "tunnel": TUNNEL.status(),
     }
 
 
@@ -535,15 +647,15 @@ def score_interesting_ship(v: dict) -> tuple[int, str, str, str]:
         return (
             125 + (1 if draught >= 15.5 else 0),
             "megaship_400m",
-            f"400m Ultra-Large Vessel ({length_m}m × {beam_m}m · {flag_short})",
-            f"{name} (IMO {v.get('imo') or '—'}) — 400m-class ultra-large container vessel ({draught}m draught), dest: '{dest}'.",
+            f"400m ULCS ({length_m}m × {beam_m}m · {flag_short})",
+            f"{name} (IMO {v.get('imo') or '—'}) — 400m-class container vessel ({draught}m draught), dest: '{dest}'.",
         )
 
     if (80 <= shiptype <= 89 and draught >= 19.0) or (draught >= 20.0 and length_m >= 300):
         return (
             112,
             "vlcc_supertanker",
-            f"Deep-Draught VLCC Tanker ({draught}m · {flag_short})",
+            f"Deep-Draught Tanker ({draught}m · {flag_short})",
             f"{name} ({length_m}m × {beam_m}m) — deep-draught tanker drawing {draught}m, dest: '{dest}'.",
         )
 
@@ -556,7 +668,7 @@ def score_interesting_ship(v: dict) -> tuple[int, str, str, str]:
         )
 
     if shiptype in (51, 55) or (shiptype == 37 and length_m >= 50):
-        badge_lbl = "Patrol Vessel" if shiptype == 55 else ("Search & Rescue" if shiptype == 51 else f"{length_m}m Yacht")
+        badge_lbl = "Patrol Craft" if shiptype == 55 else ("SAR Craft" if shiptype == 51 else f"{length_m}m Yacht")
         return (
             94,
             "special_craft",
@@ -722,7 +834,6 @@ def get_combined_map_and_log() -> dict:
     try:
         conn = psycopg2.connect(PG_DSN)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # 1. Latest position per aircraft + flight summary
             cur.execute(
                 """
                 WITH latest_pos AS (
@@ -827,7 +938,6 @@ def get_combined_map_and_log() -> dict:
                         }
                     )
 
-            # 2. Ships with valid coordinates
             cur.execute(
                 """
                 SELECT mmsi, COALESCE(NULLIF(TRIM(shipname), ''), '—') AS shipname,
@@ -895,7 +1005,6 @@ def get_combined_map_and_log() -> dict:
         if plane_to_persist:
             upsert_spotter_highlights(plane_to_persist)
 
-        # 3. Query the persistent Spotter Logbook table
         conn = psycopg2.connect(PG_DSN)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -942,428 +1051,836 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SDR Station — Launcher, Combined Map & Telemetry Hub</title>
+<title>SDR Station Console</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <style>
-  :root {
-    --bg: #080d17; --card: #111a2b; --card-hover: #162238; --border: #22324d;
-    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
-    --green: #22c55e; --amber: #f59e0b; --purple: #a855f7; --rose: #f43f5e;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.45; }
-  .wrap { max-width: 1260px; margin: 0 auto; padding: 22px; }
-  header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; padding-bottom: 18px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
-  .brand h1 { margin: 0; font-size: 1.48rem; display: flex; align-items: center; gap: 10px; }
-  .brand p { margin: 4px 0 0; color: var(--muted); font-size: 0.88rem; }
-  .sys-pills { display: flex; flex-wrap: wrap; gap: 8px; }
-  .pill { background: var(--card); border: 1px solid var(--border); padding: 6px 12px; border-radius: 999px; font-size: 0.79rem; color: var(--muted); display: flex; align-items: center; gap: 6px; }
-  .pill b { color: var(--text); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-  .dot.green { background: var(--green); box-shadow: 0 0 8px var(--green); }
-  .dot.amber { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  @layer base, tokens, layout, components, utilities;
 
-  .cycler-bar {
-    background: linear-gradient(135deg, #0f223d, #131b2e);
-    border: 1px solid #2b4c7e;
-    border-radius: 14px;
-    padding: 16px 20px;
-    margin-bottom: 22px;
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: center;
-    gap: 14px;
-  }
-  .cycler-bar.active-cycle {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.28);
-  }
-  .cycler-left { flex: 1; min-width: 280px; }
-  .cycler-title { font-weight: 700; font-size: 0.98rem; color: #f8fafc; display: flex; align-items: center; gap: 8px; }
-  .cycler-sub { font-size: 0.84rem; color: #cbd5e1; margin-top: 4px; }
-  .cycler-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  select.cycle-select, input.search-input {
-    background: #091220;
-    color: var(--text);
-    border: 1px solid #2b4c7e;
-    padding: 8px 12px;
-    border-radius: 8px;
-    font-size: 0.83rem;
-    font-weight: 600;
+  @layer tokens {
+    :root {
+      color-scheme: dark;
+      --canvas: oklch(0.13 0.006 255);
+      --surface: oklch(0.16 0.007 255);
+      --surface-raised: oklch(0.19 0.009 255);
+      --surface-well: oklch(0.115 0.005 255);
+      --line: oklch(1 0 0 / 0.08);
+      --line-strong: oklch(1 0 0 / 0.15);
+      --ink-strong: oklch(0.95 0.004 255);
+      --ink: oklch(0.83 0.008 255);
+      --ink-muted: oklch(0.62 0.012 255);
+      --ink-faint: oklch(0.46 0.012 255);
+      --accent: oklch(0.72 0.12 230);
+      --accent-soft: oklch(0.72 0.12 230 / 0.13);
+      --signal-green: oklch(0.73 0.15 152);
+      --signal-green-soft: oklch(0.73 0.15 152 / 0.14);
+      --signal-amber: oklch(0.77 0.14 75);
+      --signal-amber-soft: oklch(0.77 0.14 75 / 0.15);
+      --signal-rose: oklch(0.68 0.18 18);
+      --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      --radius-sm: 5px;
+      --radius-md: 7px;
+      --radius-lg: 10px;
+      accent-color: var(--accent);
+      scrollbar-color: oklch(0.32 0.01 255) var(--surface-well);
+    }
   }
 
-  .section-title { font-size: 1.05rem; font-weight: 700; margin: 24px 0 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; color: #f8fafc; }
-
-  .map-shell {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 14px;
-    margin-bottom: 24px;
-  }
-  .map-toolbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-bottom: 12px;
-  }
-  .filter-group { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip-btn {
-    background: #0b1322;
-    color: var(--muted);
-    border: 1px solid var(--border);
-    padding: 6px 12px;
-    border-radius: 8px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-  .chip-btn:hover { border-color: var(--accent); color: var(--text); }
-  .chip-btn.active {
-    background: rgba(56, 189, 248, 0.16);
-    color: var(--accent);
-    border-color: var(--accent);
-  }
-  .map-legend {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    font-size: 0.76rem;
-    color: var(--muted);
-  }
-  .map-legend span { display: inline-flex; align-items: center; gap: 5px; }
-  #combinedMap {
-    width: 100%;
-    height: 480px;
-    border-radius: 10px;
-    border: 1px solid #1e2f4a;
-    background: #070c14;
+  @layer base {
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    h1, h2, h3 {
+      margin: 0;
+      color: var(--ink-strong);
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      text-wrap: balance;
+    }
+    p { margin: 0; text-wrap: pretty; }
+    a { color: inherit; text-decoration: none; }
+    button, select, input {
+      font: inherit;
+      color: inherit;
+    }
+    .num {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
   }
 
-  .leaflet-popup-content-wrapper, .leaflet-popup-tip {
-    background: #0d1626 !important;
-    color: #e2e8f0 !important;
-    border: 1px solid #2b4c7e;
-    box-shadow: 0 12px 28px rgba(0,0,0,0.75);
-  }
-  .map-tag {
-    white-space: nowrap;
-    font-family: "SF Mono", Menlo, monospace;
-    font-size: 10.5px;
-    font-weight: 700;
-    padding: 2px 6px;
-    border-radius: 5px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.75);
-    pointer-events: auto;
-  }
-  .map-tag.ship-hi {
-    background: rgba(245, 158, 11, 0.94);
-    color: #090d16;
-    border: 1px solid #fde68a;
-  }
-  .map-tag.plane-hi {
-    background: rgba(244, 63, 94, 0.94);
-    color: #ffffff;
-    border: 1px solid #fecdd3;
+  @layer layout {
+    .shell {
+      max-inline-size: 1360px;
+      margin-inline: auto;
+      padding-inline: clamp(1rem, 2.5vw, 1.75rem);
+      padding-block-end: 3.5rem;
+    }
+
+    /* Top Chrome Bar (38-44px instrument bar) */
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: safe center;
+      justify-content: space-between;
+      gap: 0.75rem 1.25rem;
+      padding-block: 0.75rem;
+      border-block-end: 1px solid var(--line);
+    }
+    .brand-group {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .brand-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--ink-strong);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .brand-sub {
+      font-size: 0.78rem;
+      color: var(--ink-muted);
+    }
+    .telemetry- cluster, .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: safe center;
+      gap: 1rem;
+      font-size: 0.78rem;
+      color: var(--ink-muted);
+    }
+    .status-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .status-item strong {
+      color: var(--ink-strong);
+      font-weight: 500;
+    }
+
+    /* Unified Control & Telemetry Ribbon */
+    .ribbon {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+      gap: 1px;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      margin-block: 1rem 1.25rem;
+      overflow: clip;
+    }
+    @media (max-width: 980px) {
+      .ribbon { grid-template-columns: 1fr; }
+    }
+    .ribbon-cell {
+      background: var(--surface);
+      padding-block: 0.85rem;
+      padding-inline: 1rem;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 0.65rem;
+    }
+
+    /* Main Split Stage: Map + Notable Inspector */
+    .stage-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(340px, 1fr);
+      gap: 1rem;
+      margin-block-end: 1.5rem;
+      align-items: stretch;
+    }
+    @media (max-width: 1024px) {
+      .stage-split { grid-template-columns: 1fr; }
+    }
+
+    /* Receiver Matrix using CSS Subgrid */
+    .modes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 0.75rem;
+      margin-block-end: 1.5rem;
+    }
+    .mode-card {
+      grid-row: span 3;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      grid-template-rows: subgrid;
+      gap: 0.65rem;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      padding-block: 0.9rem;
+      padding-inline: 1rem;
+      transition: border-color 0.15s ease;
+    }
+    .mode-card[data-active="true"] {
+      border-color: oklch(0.73 0.15 152 / 0.55);
+      background: linear-gradient(180deg, oklch(0.175 0.015 152 / 0.35), var(--surface) 65%);
+    }
   }
 
-  .spotter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
-  @media (max-width: 920px) { .spotter-grid { grid-template-columns: 1fr; } }
-  .spotter-col { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; }
-  .spotter-col h3 { margin: 0 0 12px; font-size: 0.98rem; display: flex; justify-content: space-between; align-items: center; }
-  .highlight-card {
-    background: #0b1322;
-    border: 1px solid #1e3252;
-    border-radius: 10px;
-    padding: 12px 14px;
-    margin-bottom: 10px;
-  }
-  .highlight-card:last-child { margin-bottom: 0; }
-  .hl-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 5px; }
-  .hl-badge {
-    font-size: 0.72rem;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 6px;
-    background: rgba(56, 189, 248, 0.14);
-    color: var(--accent);
-    border: 1px solid rgba(56, 189, 248, 0.35);
-  }
-  .hl-name { font-weight: 700; font-size: 0.95rem; color: #f8fafc; font-family: "SF Mono", Menlo, monospace; }
-  .hl-reason { font-size: 0.82rem; color: #cbd5e1; line-height: 1.4; margin-bottom: 8px; }
-  .hl-links { display: flex; flex-wrap: wrap; gap: 6px; }
-  .hl-link {
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: #93c5fd;
-    background: #102039;
-    border: 1px solid #26436e;
-    padding: 3px 9px;
-    border-radius: 6px;
-    text-decoration: none;
-    cursor: pointer;
-  }
-  .hl-link:hover { border-color: var(--accent); color: #fff; }
-  .hl-link.map-jump {
-    background: rgba(245, 158, 11, 0.16);
-    color: #fcd34d;
-    border-color: rgba(245, 158, 11, 0.45);
-  }
+  @layer components {
+    .dot {
+      inline-size: 7px;
+      block-size: 7px;
+      border-radius: 50%;
+      display: inline-block;
+      flex: none;
+      background: var(--ink-faint);
+    }
+    .dot.live { background: var(--signal-green); }
+    .dot.amber { background: var(--signal-amber); }
 
-  .modes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px; }
-  .mode-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; transition: border-color 0.15s; }
-  .mode-card.active { border-color: var(--green); box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35), 0 8px 24px rgba(0,0,0,0.35); }
-  .mode-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
-  .mode-title { font-size: 1.06rem; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-  .freq-badge { font-family: "SF Mono", Menlo, monospace; font-size: 0.73rem; background: #091220; color: var(--accent); border: 1px solid #1e3a5f; padding: 3px 8px; border-radius: 6px; white-space: nowrap; }
-  .status-tag { font-size: 0.73rem; font-weight: 700; padding: 3px 9px; border-radius: 999px; display: inline-flex; align-items: center; gap: 5px; }
-  .status-tag.on { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.4); }
-  .status-tag.off { background: rgba(148, 163, 184, 0.1); color: var(--muted); border: 1px solid var(--border); }
-  .mode-desc { font-size: 0.84rem; color: #cbd5e1; margin: 8px 0 12px; }
-  .mode-meta { font-size: 0.75rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 10px; margin-bottom: 14px; }
-  .mode-meta div { margin-bottom: 3px; }
-  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
-  .btn { padding: 9px 14px; border-radius: 9px; font-size: 0.84rem; font-weight: 600; cursor: pointer; text-decoration: none; border: 1px solid transparent; display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; text-align: center; }
-  .btn-activate { background: #1e293b; color: var(--text); border-color: #334155; }
-  .btn-activate:hover { background: #334155; }
-  .btn-active { background: rgba(34, 197, 94, 0.18); color: #4ade80; border-color: rgba(34, 197, 94, 0.4); cursor: default; }
-  .btn-open { background: var(--accent); color: #051321; font-weight: 700; }
-  .btn-open:hover { filter: brightness(1.08); }
+    .icon-svg {
+      inline-size: 14px;
+      block-size: 14px;
+      stroke: currentColor;
+      stroke-width: 1.6;
+      fill: none;
+      flex: none;
+      opacity: 0.78;
+    }
 
-  .analytics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
-  .stat-box { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
-  .stat-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
-  .stat-val { font-size: 1.52rem; font-weight: 700; color: var(--text); margin-top: 4px; font-family: "SF Mono", Menlo, monospace; }
-  .stat-sub { font-size: 0.75rem; color: var(--accent); margin-top: 2px; }
+    /* Segmented Controls (Stageshow / Radix style) */
+    .segmented {
+      display: inline-flex;
+      flex-wrap: wrap;
+      background: var(--surface-well);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      padding: 2px;
+      gap: 2px;
+    }
+    .seg-btn {
+      background: transparent;
+      border: none;
+      color: var(--ink-muted);
+      font-size: 0.76rem;
+      font-weight: 500;
+      padding-block: 0.28rem;
+      padding-inline: 0.65rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: background-color 0.12s ease, color 0.12s ease;
+    }
+    .seg-btn:hover:not(.active) { color: var(--ink-strong); }
+    .seg-btn.active {
+      background: var(--surface-raised);
+      color: var(--ink-strong);
+      box-shadow: 0 1px 2px oklch(0 0 0 / 0.35);
+    }
 
-  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
-  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; overflow-x: auto; margin-bottom: 18px; }
-  .panel h3 { margin: 0 0 12px; font-size: 0.98rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.81rem; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
-  td.mono { font-family: "SF Mono", Menlo, monospace; }
-  .dl-link { font-size: 0.78rem; color: var(--accent); text-decoration: none; border: 1px solid var(--border); padding: 4px 10px; border-radius: 6px; background: #091220; }
-  .dl-link:hover { border-color: var(--accent); }
+    /* Controls & Buttons */
+    .btn {
+      min-block-size: 1.95rem;
+      padding-block: 0.3rem;
+      padding-inline: 0.75rem;
+      border-radius: var(--radius-sm);
+      font-size: 0.78rem;
+      font-weight: 500;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-raised);
+      color: var(--ink-strong);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      white-space: nowrap;
+      flex: none;
+      transition: background-color 0.12s ease, border-color 0.12s ease;
+    }
+    .btn:hover:not(:disabled) {
+      background: oklch(0.23 0.01 255);
+      border-color: oklch(1 0 0 / 0.24);
+    }
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .btn-primary {
+      background: var(--ink-strong);
+      color: var(--canvas);
+      border-color: transparent;
+      font-weight: 600;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: oklch(0.88 0.005 255);
+    }
+    .btn-subtle {
+      background: transparent;
+      border-color: var(--line);
+      color: var(--ink-muted);
+    }
+    .btn-subtle:hover:not(:disabled) {
+      color: var(--ink-strong);
+      border-color: var(--line-strong);
+      background: var(--surface-raised);
+    }
+
+    select.ctrl-select, input.ctrl-input {
+      min-block-size: 1.95rem;
+      background: var(--surface-well);
+      color: var(--ink-strong);
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      padding-block: 0.25rem;
+      padding-inline: 0.6rem;
+      font-size: 0.78rem;
+    }
+    input.ctrl-input {
+      field-sizing: content;
+      min-inline-size: 180px;
+    }
+
+    /* Inline KPI Readout Grid inside Ribbon */
+    .kpi-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.75rem;
+      align-items: baseline;
+    }
+    @media (max-width: 640px) {
+      .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+    }
+    .kpi-item {
+      border-inline-start: 1px solid var(--line);
+      padding-inline-start: 0.75rem;
+    }
+    .kpi-item:first-child {
+      border-inline-start: none;
+      padding-inline-start: 0;
+    }
+    .kpi-label {
+      font-size: 0.7rem;
+      color: var(--ink-muted);
+    }
+    .kpi-val {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 1.2rem;
+      font-weight: 600;
+      color: var(--ink-strong);
+      line-height: 1.25;
+      margin-block-start: 0.1rem;
+    }
+    .kpi-sub {
+      font-size: 0.7rem;
+      color: var(--ink-faint);
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Surface Panels */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      display: flex;
+      flex-direction: column;
+      overflow: clip;
+    }
+    .panel-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: safe center;
+      justify-content: space-between;
+      gap: 0.5rem 0.75rem;
+      padding-block: 0.65rem;
+      padding-inline: 0.9rem;
+      border-block-end: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .panel-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--ink-strong);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    .panel-meta {
+      font-size: 0.74rem;
+      color: var(--ink-muted);
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    #combinedMap {
+      inline-size: 100%;
+      block-size: 470px;
+      background: var(--surface-well);
+    }
+    .leaflet-tile-pane {
+      filter: brightness(0.72) contrast(1.08) saturate(0.75);
+    }
+    .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+      background: var(--surface) !important;
+      color: var(--ink) !important;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-md);
+      box-shadow: 0 12px 28px oklch(0 0 0 / 0.6);
+    }
+    .map-tag {
+      white-space: nowrap;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 4px;
+      box-shadow: 0 2px 6px oklch(0 0 0 / 0.65);
+    }
+    .map-tag.ship-hi {
+      background: oklch(0.22 0.04 75 / 0.95);
+      color: oklch(0.92 0.08 75);
+      border: 1px solid oklch(0.77 0.14 75 / 0.6);
+    }
+    .map-tag.plane-hi {
+      background: oklch(0.22 0.05 18 / 0.95);
+      color: oklch(0.92 0.06 18);
+      border: 1px solid oklch(0.68 0.18 18 / 0.6);
+    }
+
+    /* Notable Inspector Rows (Stageshow Row discipline: 10-12px padding, 4px title-sub gap) */
+    .inspector-list {
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      max-block-size: 470px;
+      scrollbar-gutter: stable;
+      overscroll-behavior: contain;
+    }
+    .ins-group-label {
+      padding-block: 0.4rem;
+      padding-inline: 0.9rem;
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: var(--ink-muted);
+      background: var(--surface-well);
+      border-block-end: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+    }
+    .ins-row {
+      padding-block: 0.65rem;
+      padding-inline: 0.9rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .ins-row:not(:last-child) {
+      border-block-end: 1px solid var(--line);
+    }
+    .ins-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 0.5rem;
+    }
+    .ins-name {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--ink-strong);
+    }
+    .tag-spec {
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      color: var(--ink-muted);
+      background: var(--surface-raised);
+      border: 1px solid var(--line);
+      padding-block: 0.1rem;
+      padding-inline: 0.42rem;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .ins-desc {
+      font-size: 0.76rem;
+      color: var(--ink-muted);
+      line-height: 1.38;
+    }
+    .ins-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-block-start: 0.2rem;
+    }
+    .action-chip {
+      font-size: 0.69rem;
+      font-weight: 500;
+      color: var(--ink);
+      background: var(--surface-well);
+      border: 1px solid var(--line);
+      padding-block: 0.12rem;
+      padding-inline: 0.48rem;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .action-chip:hover {
+      border-color: var(--line-strong);
+      color: var(--ink-strong);
+      background: var(--surface-raised);
+    }
+    .action-chip.locate {
+      color: var(--accent);
+      border-color: oklch(0.72 0.12 230 / 0.35);
+    }
+
+    /* Section Header */
+    .sec-bar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 0.5rem;
+      margin-block: 1.25rem 0.65rem;
+    }
+    .sec-bar h2 {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--ink-strong);
+    }
+    .sec-bar span {
+      font-size: 0.76rem;
+      color: var(--ink-muted);
+    }
+
+    /* Mode Card Internals */
+    .mode-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.5rem;
+    }
+    .mode-name {
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: var(--ink-strong);
+    }
+    .mode-freq {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--ink-muted);
+      margin-block-start: 0.15rem;
+    }
+    .mode-state {
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      padding-block: 0.12rem;
+      padding-inline: 0.45rem;
+      border-radius: 4px;
+      border: 1px solid var(--line);
+      color: var(--ink-muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      white-space: nowrap;
+    }
+    .mode-state.on {
+      color: var(--signal-green);
+      background: var(--signal-green-soft);
+      border-color: oklch(0.73 0.15 152 / 0.35);
+    }
+    .mode-body {
+      font-size: 0.78rem;
+      color: var(--ink-muted);
+      line-height: 1.45;
+    }
+    .mode-foot {
+      border-block-start: 1px solid var(--line);
+      padding-block-start: 0.65rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .mode-endpoint {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--ink-faint);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Unified Data Table */
+    .table-scroll {
+      max-block-size: 420px;
+      overflow-y: auto;
+      scrollbar-gutter: stable;
+      overscroll-behavior: contain;
+    }
+    table {
+      inline-size: 100%;
+      border-collapse: collapse;
+      font-size: 0.79rem;
+    }
+    th, td {
+      text-align: start;
+      padding-block: 0.55rem;
+      padding-inline: 0.85rem;
+      vertical-align: middle;
+    }
+    th {
+      position: sticky;
+      inset-block-start: 0;
+      background: var(--surface-well);
+      color: var(--ink-muted);
+      font-size: 0.72rem;
+      font-weight: 500;
+      border-block-end: 1px solid var(--line);
+      z-index: 2;
+    }
+    tbody tr:not(:last-child) td {
+      border-block-end: 1px solid var(--line);
+    }
+    tbody tr:hover td {
+      background: oklch(1 0 0 / 0.02);
+    }
+
+    /* Tunnel Share Bar */
+    .tunnel-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding-block: 0.2rem;
+      padding-inline: 0.5rem;
+    }
+    .tunnel-url {
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--accent);
+      max-inline-size: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="brand">
-      <h1>SDR Radio Receiver Station</h1>
-      <p>Raspberry Pi CM4 · Nooelec NESDR SMArt v5 · PostgreSQL 17 + TimescaleDB</p>
+<div class="shell">
+  <!-- TOP INSTRUMENT BAR -->
+  <header class="topbar">
+    <div class="brand-group">
+      <div class="brand-title">
+        <span class="dot live" id="usbDot"></span>
+        <span>SDR Receiver Console</span>
+      </div>
+      <span class="brand-sub" id="usbName">Nooelec NESDR SMArt v5 · Raspberry Pi CM4 · TimescaleDB</span>
     </div>
-    <div class="sys-pills">
-      <div class="pill"><span class="dot green" id="usbDot"></span> <b id="usbName">Checking SDR...</b></div>
-      <div class="pill">CPU: <b id="cpuTemp">--</b></div>
-      <div class="pill">LAN: <b id="lanIp">--</b></div>
-      <div class="pill">Tailscale: <b id="tsIp">--</b></div>
-      <a class="pill" href="https://github.com/smichpresel/sdr-station/blob/main/doc/README.md" target="_blank" style="text-decoration:none;color:var(--accent)">Build Documentation</a>
+
+    <div class="status-strip">
+      <div class="status-item">CPU <strong class="num" id="cpuTemp">--</strong></div>
+      <div class="status-item">LAN <strong id="lanIp">--</strong></div>
+      <div class="status-item">Tailscale <strong id="tsIp">--</strong></div>
+
+      <!-- CLOUDFLARE QUICK TUNNEL SHARE CONTROL -->
+      <div class="tunnel-box" id="tunnelBox">
+        <span class="dot" id="tunnelDot"></span>
+        <span id="tunnelLabel" style="font-size:0.74rem;color:var(--ink-muted)">Public Share:</span>
+        <a class="tunnel-url" id="tunnelUrlLink" href="#" target="_blank" rel="noopener" style="display:none"></a>
+        <button class="action-chip" id="tunnelCopyBtn" style="display:none" onclick="copyTunnelUrl()">Copy URL</button>
+        <button class="action-chip locate" id="tunnelToggleBtn" onclick="toggleTunnel()">Share via Cloudflare</button>
+      </div>
+
+      <a class="btn btn-subtle" href="https://github.com/smichpresel/sdr-station/blob/main/doc/README.md" target="_blank" rel="noopener">Documentation</a>
     </div>
   </header>
 
-  <div class="cycler-bar" id="cyclerBar">
-    <div class="cycler-left">
-      <div class="cycler-title">
-        <span class="dot green" id="cyclerDot"></span>
-        <span id="cyclerHeadline">Dual-Band Auto-Cycler (ADS-B 1090 MHz / Marine AIS 162 MHz)</span>
+  <!-- UNIFIED CYCLER + TELEMETRY RIBBON -->
+  <section class="ribbon" aria-label="Tuner schedule and telemetry">
+    <div class="ribbon-cell">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <span class="dot live" id="cyclerDot"></span>
+          <strong style="font-size:0.84rem;color:var(--ink-strong)" id="cyclerHeadline">Dual-Band Auto-Cycler (1090 MHz ADS-B / 162 MHz AIS)</strong>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap">
+          <select class="ctrl-select num" id="cycleIntervalSelect" onchange="changeCycleInterval()" aria-label="Cycle interval">
+            <option value="60">1m window</option>
+            <option value="120" selected>2m window</option>
+            <option value="180">3m window</option>
+            <option value="300">5m window</option>
+            <option value="600">10m window</option>
+          </select>
+          <button class="btn" id="cyclerToggleBtn" onclick="toggleCycler()">Pause Cycler</button>
+          <button class="btn btn-subtle" onclick="switchMode('off')">Standby</button>
+        </div>
       </div>
-      <div class="cycler-sub" id="cyclerSub">
-        Alternates the RTL-SDR v5 between aircraft Mode-S reception and VHF marine AIS reception automatically.
-      </div>
-    </div>
-    <div class="cycler-controls">
-      <select class="cycle-select" id="cycleIntervalSelect" onchange="changeCycleInterval()">
-        <option value="60">Cycle: 1 min each</option>
-        <option value="120" selected>Cycle: 2 min each (Default)</option>
-        <option value="180">Cycle: 3 min each</option>
-        <option value="300">Cycle: 5 min each</option>
-        <option value="600">Cycle: 10 min each</option>
-      </select>
-      <button class="btn btn-open" id="cyclerToggleBtn" style="flex:none" onclick="toggleCycler()">
-        Toggle Auto-Cycler
-      </button>
-      <button class="btn btn-activate" style="flex:none" onclick="switchMode('off')">
-        Standby
-      </button>
-    </div>
-  </div>
-
-  <!-- COMBINED AIR & SEA RADAR MAP -->
-  <div class="section-title" id="mapSection">
-    <span>Combined Air &amp; Sea Map — Aircraft &amp; Vessels</span>
-    <span style="font-size:0.78rem;font-weight:400;color:var(--muted)" id="mapCountBanner">Loading radar targets...</span>
-  </div>
-  <div class="map-shell">
-    <div class="map-toolbar">
-      <div class="filter-group">
-        <button class="chip-btn active" id="fltAll" onclick="setMapFilter('all')">All Air &amp; Sea</button>
-        <button class="chip-btn" id="fltHighlights" onclick="setMapFilter('highlights')">Notable Highlights Only</button>
-        <button class="chip-btn" id="fltShips" onclick="setMapFilter('ships')">Ships Only</button>
-        <button class="chip-btn" id="fltPlanes" onclick="setMapFilter('planes')">Aircraft Only</button>
-        <button class="chip-btn" onclick="fitMapHighlights()">Zoom to Highlights</button>
-        <button class="chip-btn" onclick="resetMapView()">Reset View</button>
-      </div>
-      <div class="map-legend">
-        <span><span class="dot" style="background:#f59e0b;box-shadow:0 0 8px #f59e0b"></span> Notable Ship</span>
-        <span><span class="dot" style="background:#f43f5e;box-shadow:0 0 8px #f43f5e"></span> Notable Aircraft</span>
-        <span><span class="dot" style="background:#22c55e"></span> Vessel (AIS)</span>
-        <span><span class="dot" style="background:#38bdf8"></span> Aircraft (ADS-B)</span>
-      </div>
-    </div>
-    <div id="combinedMap"></div>
-  </div>
-
-  <div class="section-title">
-    <span>Notable Catches of the Day — Aircraft &amp; Vessels</span>
-    <span style="font-size:0.78rem;font-weight:400;color:var(--muted)">Ranked from TimescaleDB (400m ULCS vessels, deep-draught tankers, corporate jets, four-engine widebodies)</span>
-  </div>
-
-  <div class="spotter-grid">
-    <div class="spotter-col">
-      <h3>
-        <span>Top 3 Notable Aircraft Today</span>
-        <span style="font-size:0.74rem;color:var(--muted)">1090 MHz Mode-S · Public Lookups</span>
-      </h3>
-      <div id="topPlanesContainer">Loading aircraft highlights...</div>
+      <p style="font-size:0.76rem;color:var(--ink-muted)" id="cyclerSub">
+        Alternating single RTL-SDR tuner between Mode-S aircraft reception and VHF maritime AIS reception.
+      </p>
     </div>
 
-    <div class="spotter-col">
-      <h3>
-        <span>Top 3 Notable Ships Today</span>
-        <span style="font-size:0.74rem;color:var(--muted)">162 MHz AIS · Public Lookups</span>
-      </h3>
-      <div id="topShipsContainer">Loading vessel highlights...</div>
-    </div>
-  </div>
-
-  <!-- PERSISTENT HISTORICAL SPOTTER LOGBOOK -->
-  <div class="panel" id="logbookSection">
-    <h3>
-      <div>
-        <span>Saved Spotter Logbook — Notable Ships &amp; Aircraft Recorded</span>
-        <span style="font-size:0.76rem;font-weight:400;color:var(--muted);margin-left:8px" id="logbookCountLabel">(0 saved)</span>
+    <div class="ribbon-cell">
+      <div class="kpi-strip">
+        <div class="kpi-item">
+          <div class="kpi-label">ADS-B Track Points</div>
+          <div class="kpi-val" id="stAdsbPos">0</div>
+          <div class="kpi-sub" id="stAdsbAc">0 aircraft</div>
+        </div>
+        <div class="kpi-item">
+          <div class="kpi-label">Peak Baro Altitude</div>
+          <div class="kpi-val" id="stAdsbRange">—</div>
+          <div class="kpi-sub" id="stAdsbAlt">RSSI —</div>
+        </div>
+        <div class="kpi-item">
+          <div class="kpi-label">AIS Vessels Tracked</div>
+          <div class="kpi-val" id="stAisVessels">0</div>
+          <div class="kpi-sub" id="stAisNamed">0 named</div>
+        </div>
+        <div class="kpi-item">
+          <div class="kpi-label">TimescaleDB Size</div>
+          <div class="kpi-val" id="stDbSize">—</div>
+          <div class="kpi-sub" id="stAisMsgs">0 AIS msgs</div>
+        </div>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <button class="chip-btn active" id="logFltAll" onclick="setLogFilter('all')">All</button>
-        <button class="chip-btn" id="logFltShip" onclick="setLogFilter('ship')">Notable Ships</button>
-        <button class="chip-btn" id="logFltAircraft" onclick="setLogFilter('aircraft')">Notable Aircraft</button>
-        <button class="chip-btn" id="logFltNotable" onclick="setLogFilter('notable')">400m ULCS &amp; Quadjets</button>
-        <input class="search-input" id="logSearchInput" type="text" placeholder="Search name, MMSI, reg, type..." oninput="renderLogbookTable()">
-        <a class="dl-link" href="/api/highlights/export.csv">Export Logbook CSV</a>
-      </div>
-    </h3>
-    <div style="max-height:390px;overflow-y:auto">
-      <table>
-        <thead>
-          <tr>
-            <th>Domain</th>
-            <th>Vessel / Aircraft</th>
-            <th>Classification</th>
-            <th>Details &amp; Specifications</th>
-            <th>Last Seen</th>
-            <th>Map &amp; Public Lookups</th>
-          </tr>
-        </thead>
-        <tbody id="logbookTableBody">
-          <tr><td colspan="6">Loading saved spotter logbook...</td></tr>
-        </tbody>
-      </table>
     </div>
-  </div>
+  </section>
 
-  <div class="section-title">
-    <span>Installed SDR Applications &amp; Manual Mode Switcher</span>
-    <span style="font-size:0.8rem;font-weight:400;color:var(--muted)" id="activeBanner">Loading status...</span>
+  <!-- PRIMARY SPLIT STAGE: COMBINED RADAR MAP + NOTABLE CATCHES INSPECTOR -->
+  <section class="stage-split" id="mapSection">
+    <div class="panel">
+      <div class="panel-bar">
+        <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
+          <span class="panel-title">Combined Air &amp; Sea Plot</span>
+          <div class="segmented" role="tablist" aria-label="Map layer filter">
+            <button class="seg-btn active" id="fltAll" onclick="setMapFilter('all')">All Traffic</button>
+            <button class="seg-btn" id="fltHighlights" onclick="setMapFilter('highlights')">Notable Only</button>
+            <button class="seg-btn" id="fltShips" onclick="setMapFilter('ships')">Vessels</button>
+            <button class="seg-btn" id="fltPlanes" onclick="setMapFilter('planes')">Aircraft</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.65rem;flex-wrap:wrap">
+          <span class="panel-meta" id="mapCountBanner">Loading targets...</span>
+          <button class="action-chip" onclick="fitMapHighlights()">Fit Notable</button>
+        </div>
+      </div>
+      <div id="combinedMap"></div>
+      <div class="panel-bar" style="border-block-start:1px solid var(--line);border-block-end:none;padding-block:0.45rem">
+        <div style="display:flex;gap:1rem;font-size:0.72rem;color:var(--ink-muted);flex-wrap:wrap">
+          <span style="display:inline-flex;align-items:center;gap:0.35rem"><span class="dot" style="background:var(--signal-amber)"></span> Notable Vessel</span>
+          <span style="display:inline-flex;align-items:center;gap:0.35rem"><span class="dot" style="background:var(--signal-rose)"></span> Notable Aircraft</span>
+          <span style="display:inline-flex;align-items:center;gap:0.35rem"><span class="dot" style="background:var(--signal-green)"></span> AIS Vessel</span>
+          <span style="display:inline-flex;align-items:center;gap:0.35rem"><span class="dot" style="background:var(--accent)"></span> ADS-B Aircraft</span>
+        </div>
+        <span class="panel-meta">1090 MHz Mode-S + 162 MHz AIS</span>
+      </div>
+    </div>
+
+    <!-- RIGHT INSPECTOR: TODAY'S TOP NOTABLE AIRCRAFT & VESSELS -->
+    <aside class="panel" aria-label="Notable catches of the day">
+      <div class="panel-bar">
+        <span class="panel-title">Notable Catches Today</span>
+        <span class="panel-meta">Auto-ranked · Public DB links</span>
+      </div>
+      <div class="inspector-list">
+        <div class="ins-group-label">
+          <span>Top 3 Aircraft (1090 MHz)</span>
+          <span>tar1090-db</span>
+        </div>
+        <div id="topPlanesContainer">
+          <div class="ins-row"><span class="ins-desc">Loading aircraft records...</span></div>
+        </div>
+        <div class="ins-group-label" style="border-block-start:1px solid var(--line)">
+          <span>Top 3 Vessels (162 MHz)</span>
+          <span>AIS Static + Position</span>
+        </div>
+        <div id="topShipsContainer">
+          <div class="ins-row"><span class="ins-desc">Loading vessel records...</span></div>
+        </div>
+      </div>
+    </aside>
+  </section>
+
+  <!-- RECEIVER MODE MATRIX (SUBGRID) -->
+  <div class="sec-bar">
+    <h2>Receiver Demodulators &amp; Network Streams</h2>
+    <span id="activeBanner">Checking active tuner lock...</span>
   </div>
   <div class="modes-grid" id="modesGrid"></div>
 
-  <div class="section-title">
-    <span>TimescaleDB Aviation &amp; Marine AIS Analytics</span>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <a class="dl-link" href="/api/adsb/export.csv">Download ADS-B Positions CSV</a>
-      <a class="dl-link" href="/api/ais/export.csv">Download AIS Vessels CSV</a>
-    </div>
-  </div>
+  <!-- UNIFIED TABBED LOGBOOK & TELEMETRY TABLES -->
+  <section class="panel" id="logbookSection">
+    <div class="panel-bar">
+      <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
+        <div class="segmented" role="tablist" aria-label="Dataset view">
+          <button class="seg-btn active" id="tabBtnLogbook" onclick="switchTableTab('logbook')">Saved Notable Logbook</button>
+          <button class="seg-btn" id="tabBtnAircraft" onclick="switchTableTab('aircraft')">Recent Aircraft (adsb_flights)</button>
+          <button class="seg-btn" id="tabBtnVessels" onclick="switchTableTab('vessels')">Recent Vessels (ais_state)</button>
+        </div>
+        <span class="panel-meta" id="logbookCountLabel"></span>
+      </div>
 
-  <div class="analytics-grid">
-    <div class="stat-box">
-      <div class="stat-label">ADS-B Hypertable Rows</div>
-      <div class="stat-val" id="stAdsbPos">0</div>
-      <div class="stat-sub" id="stAdsbAc">0 unique aircraft</div>
+      <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap">
+        <div class="segmented" id="logSubFilters">
+          <button class="seg-btn active" id="logFltAll" onclick="setLogFilter('all')">All</button>
+          <button class="seg-btn" id="logFltShip" onclick="setLogFilter('ship')">Ships</button>
+          <button class="seg-btn" id="logFltAircraft" onclick="setLogFilter('aircraft')">Aircraft</button>
+          <button class="seg-btn" id="logFltNotable" onclick="setLogFilter('notable')">400m ULCS &amp; Quadjets</button>
+        </div>
+        <input class="ctrl-input" id="logSearchInput" type="search" placeholder="Filter by name, MMSI, ICAO, type..." oninput="renderActiveTable()">
+        <a class="btn btn-subtle" href="/api/highlights/export.csv">Logbook CSV</a>
+        <a class="btn btn-subtle" href="/api/adsb/export.csv">ADS-B CSV</a>
+        <a class="btn btn-subtle" href="/api/ais/export.csv">AIS CSV</a>
+      </div>
     </div>
-    <div class="stat-box">
-      <div class="stat-label">ADS-B Altitude &amp; Signal</div>
-      <div class="stat-val" id="stAdsbRange">—</div>
-      <div class="stat-sub" id="stAdsbAlt">Max alt: —</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-label">Marine AIS Vessels Seen</div>
-      <div class="stat-val" id="stAisVessels">0</div>
-      <div class="stat-sub" id="stAisNamed">0 with static ship name</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-label">TimescaleDB Hypertables</div>
-      <div class="stat-val" id="stAisMsgs">0</div>
-      <div class="stat-sub" id="stDbSize">PostgreSQL 17 + TimescaleDB 2.19</div>
-    </div>
-  </div>
 
-  <div class="two-col">
-    <div class="panel">
-      <h3>
-        <span>Recent Aircraft Logged (TimescaleDB)</span>
-        <span style="font-size:0.75rem;color:var(--muted)">adsb_flights</span>
-      </h3>
-      <table>
-        <thead>
-          <tr><th>ICAO</th><th>Callsign</th><th>Reg / Type</th><th>Alt (ft)</th><th>Samples</th><th>Lookup</th></tr>
+    <div class="table-scroll">
+      <table id="logbookTable">
+        <thead id="unifiedTableHead">
+          <tr>
+            <th>Domain</th>
+            <th>Identifier / Name</th>
+            <th>Classification</th>
+            <th>Specifications &amp; Notes</th>
+            <th>Last Seen</th>
+            <th>Actions</th>
+          </tr>
         </thead>
-        <tbody id="adsbTableBody">
-          <tr><td colspan="6">Loading aircraft history...</td></tr>
+        <tbody id="unifiedTableBody">
+          <tr><td colspan="6">Loading records from TimescaleDB...</td></tr>
         </tbody>
       </table>
     </div>
-
-    <div class="panel">
-      <h3>
-        <span>Recent Vessels Logged (TimescaleDB)</span>
-        <span style="font-size:0.75rem;color:var(--muted)">ais_state</span>
-      </h3>
-      <table>
-        <thead>
-          <tr><th>MMSI</th><th>Vessel Name</th><th>Size</th><th>Destination</th><th>Speed</th><th>Lookup</th></tr>
-        </thead>
-        <tbody id="aisTableBody">
-          <tr><td colspan="6">Loading vessel history...</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
+  </section>
 </div>
 
 <script>
 const host = window.location.hostname;
 let modesMeta = {};
 let cyclerState = {enabled: false, interval_sec: 120};
+let tunnelState = {enabled: false, url: null};
 let switching = false;
 
 let map = null;
 let mapLayerGroup = null;
 let markerIndex = {};
-let initialBoundsFitted = false;
 let cachedMapData = {station: {}, aircraft: [], ships: [], highlights_log: []};
+let cachedAdsb = {};
+let cachedAis = {};
 let currentMapFilter = 'all';
 let currentLogFilter = 'all';
+let currentTableTab = 'logbook';
 
 function initMap() {
   if (map) return;
@@ -1377,34 +1894,34 @@ function initMap() {
 
 function buildPopupHtml(domain, item) {
   const linksHtml = (item.links || []).map(l =>
-    `<a class="hl-link" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`
+    `<a class="action-chip" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`
   ).join(' ');
   if (domain === 'ship') {
     return `
-      <div style="min-width:240px;font-family:sans-serif">
-        <div style="font-weight:700;font-size:0.95rem;color:#f8fafc;margin-bottom:3px">${item.shipname}</div>
-        <div style="margin-bottom:6px"><span class="hl-badge">${item.badge}</span></div>
-        <div style="font-size:0.8rem;color:#cbd5e1;margin-bottom:6px">${item.reason}</div>
-        <div style="font-size:0.76rem;color:#94a3b8;margin-bottom:8px;font-family:monospace">
-          MMSI: ${item.mmsi} ${item.imo ? '· IMO: ' + item.imo : ''}<br>
-          Hull: ${item.len_m || '—'}m × ${item.beam_m || '—'}m · Draught: ${item.draught || '—'}m<br>
-          Speed: ${item.speed ?? '—'} kt · Course: ${item.course ?? '—'}°
+      <div style="min-inline-size:230px">
+        <div class="num" style="font-weight:600;font-size:0.88rem;color:var(--ink-strong);margin-block-end:4px">${item.shipname}</div>
+        <div style="margin-block-end:6px"><span class="tag-spec">${item.badge}</span></div>
+        <div style="font-size:0.76rem;color:var(--ink);margin-block-end:6px">${item.reason}</div>
+        <div class="num" style="font-size:0.72rem;color:var(--ink-muted);margin-block-end:8px">
+          MMSI ${item.mmsi}${item.imo ? ' · IMO ' + item.imo : ''}<br>
+          Hull ${item.len_m || '—'}m × ${item.beam_m || '—'}m · Draught ${item.draught || '—'}m<br>
+          Speed ${item.speed ?? '—'} kt · Course ${item.course ?? '—'}°
         </div>
-        <div style="display:flex;gap:5px;flex-wrap:wrap">${linksHtml}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">${linksHtml}</div>
       </div>
     `;
   } else {
     const title = item.callsign && item.callsign !== '—' ? `${item.callsign} (${item.reg})` : `${item.hex} (${item.reg})`;
     return `
-      <div style="min-width:240px;font-family:sans-serif">
-        <div style="font-weight:700;font-size:0.95rem;color:#f8fafc;margin-bottom:3px">${title}</div>
-        <div style="margin-bottom:6px"><span class="hl-badge">${item.badge}</span></div>
-        <div style="font-size:0.8rem;color:#cbd5e1;margin-bottom:6px">${item.reason}</div>
-        <div style="font-size:0.76rem;color:#94a3b8;margin-bottom:8px;font-family:monospace">
-          ICAO: ${item.hex} · Type: ${item.type_desc}<br>
-          Alt: ${item.alt_baro ?? '—'} ft · Speed: ${item.gs ?? '—'} kt · Track: ${item.track ?? '—'}°
+      <div style="min-inline-size:230px">
+        <div class="num" style="font-weight:600;font-size:0.88rem;color:var(--ink-strong);margin-block-end:4px">${title}</div>
+        <div style="margin-block-end:6px"><span class="tag-spec">${item.badge}</span></div>
+        <div style="font-size:0.76rem;color:var(--ink);margin-block-end:6px">${item.reason}</div>
+        <div class="num" style="font-size:0.72rem;color:var(--ink-muted);margin-block-end:8px">
+          ICAO ${item.hex} · ${item.type_desc}<br>
+          Alt ${item.alt_baro ?? '—'} ft · Speed ${item.gs ?? '—'} kt · Track ${item.track ?? '—'}°
         </div>
-        <div style="display:flex;gap:5px;flex-wrap:wrap">${linksHtml}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">${linksHtml}</div>
       </div>
     `;
   }
@@ -1418,7 +1935,6 @@ function renderCombinedMap() {
   const ships = cachedMapData.ships || [];
   const planes = cachedMapData.aircraft || [];
   let shownShips = 0, shownPlanes = 0, hiCount = 0;
-  const allPts = [];
 
   const topShipIds = new Set(
     ships.filter(s => s.is_interesting).sort((a, b) => b.score - a.score).slice(0, 5).map(s => s.id)
@@ -1428,23 +1944,22 @@ function renderCombinedMap() {
       if (currentMapFilter === 'highlights' && !s.is_interesting) return;
       shownShips++;
       if (s.is_interesting) hiCount++;
-      allPts.push([s.lat, s.lon]);
 
       let marker;
       if (s.is_interesting) {
         const showLabel = topShipIds.has(s.id);
         marker = L.circleMarker([s.lat, s.lon], {
-          radius: 7,
-          color: '#fef08a',
-          weight: 2,
+          radius: 6.5,
+          color: '#fde68a',
+          weight: 1.8,
           fillColor: '#f59e0b',
-          fillOpacity: 0.95
+          fillOpacity: 0.92
         });
         if (showLabel) {
           marker.bindTooltip(`${s.shipname}`, {
             permanent: true,
             direction: 'right',
-            offset: [8, 0],
+            offset: [7, 0],
             className: 'map-tag ship-hi'
           });
         } else {
@@ -1452,7 +1967,7 @@ function renderCombinedMap() {
         }
       } else {
         marker = L.circleMarker([s.lat, s.lon], {
-          radius: 3.8,
+          radius: 3.6,
           color: '#052e16',
           weight: 1,
           fillColor: '#22c55e',
@@ -1474,24 +1989,23 @@ function renderCombinedMap() {
       if (currentMapFilter === 'highlights' && !p.is_interesting) return;
       shownPlanes++;
       if (p.is_interesting) hiCount++;
-      allPts.push([p.lat, p.lon]);
 
       let marker;
       const lbl = p.callsign !== '—' ? p.callsign : (p.reg !== '—' ? p.reg : p.hex);
       if (p.is_interesting) {
         const showLabel = topPlaneIds.has(p.id);
         marker = L.circleMarker([p.lat, p.lon], {
-          radius: 7,
+          radius: 6.5,
           color: '#fecdd3',
-          weight: 2,
+          weight: 1.8,
           fillColor: '#f43f5e',
-          fillOpacity: 0.95
+          fillOpacity: 0.92
         });
         if (showLabel) {
           marker.bindTooltip(`${lbl}`, {
             permanent: true,
             direction: 'right',
-            offset: [8, 0],
+            offset: [7, 0],
             className: 'map-tag plane-hi'
           });
         } else {
@@ -1499,7 +2013,7 @@ function renderCombinedMap() {
         }
       } else {
         marker = L.circleMarker([p.lat, p.lon], {
-          radius: 4.2,
+          radius: 4.0,
           color: '#082f49',
           weight: 1,
           fillColor: '#38bdf8',
@@ -1514,7 +2028,7 @@ function renderCombinedMap() {
   }
 
   document.getElementById('mapCountBanner').textContent =
-    `Showing ${shownPlanes} aircraft + ${shownShips} vessels (${hiCount} notable catches highlighted)`;
+    `${shownPlanes} aircraft · ${shownShips} vessels (${hiCount} notable)`;
 }
 
 function setMapFilter(flt) {
@@ -1526,17 +2040,13 @@ function setMapFilter(flt) {
   renderCombinedMap();
 }
 
-function resetMapView() {
-  fitMapHighlights();
-}
-
 function fitMapHighlights() {
   if (!map) return;
   const pts = [];
   (cachedMapData.ships || []).forEach(s => { if (s.is_interesting) pts.push([s.lat, s.lon]); });
   (cachedMapData.aircraft || []).forEach(p => { if (p.is_interesting) pts.push([p.lat, p.lon]); });
   if (pts.length > 0) {
-    map.fitBounds(pts, {padding: [45, 45], maxZoom: 11});
+    map.fitBounds(pts, {padding: [40, 40], maxZoom: 11});
   }
 }
 
@@ -1550,10 +2060,19 @@ function locateOnMap(domain, targetId, lat, lon) {
   if (m && map) {
     const ll = m.getLatLng();
     map.setView(ll, 12, {animate: true});
-    setTimeout(() => m.openPopup(), 300);
+    setTimeout(() => m.openPopup(), 250);
   } else if (lat && lon && map) {
     map.setView([lat, lon], 12, {animate: true});
   }
+}
+
+function switchTableTab(tab) {
+  currentTableTab = tab;
+  document.getElementById('tabBtnLogbook').classList.toggle('active', tab === 'logbook');
+  document.getElementById('tabBtnAircraft').classList.toggle('active', tab === 'aircraft');
+  document.getElementById('tabBtnVessels').classList.toggle('active', tab === 'vessels');
+  document.getElementById('logSubFilters').style.display = tab === 'logbook' ? 'inline-flex' : 'none';
+  renderActiveTable();
 }
 
 function setLogFilter(flt) {
@@ -1562,55 +2081,177 @@ function setLogFilter(flt) {
   document.getElementById('logFltShip').classList.toggle('active', flt === 'ship');
   document.getElementById('logFltAircraft').classList.toggle('active', flt === 'aircraft');
   document.getElementById('logFltNotable').classList.toggle('active', flt === 'notable');
-  renderLogbookTable();
+  renderActiveTable();
 }
 
-function renderLogbookTable() {
-  const rows = cachedMapData.highlights_log || [];
+function renderActiveTable() {
+  const thead = document.getElementById('unifiedTableHead');
+  const tbody = document.getElementById('unifiedTableBody');
   const q = (document.getElementById('logSearchInput').value || '').trim().toLowerCase();
-  const filtered = rows.filter(r => {
-    if (currentLogFilter === 'ship' && r.domain !== 'ship') return false;
-    if (currentLogFilter === 'aircraft' && r.domain !== 'aircraft') return false;
-    if (currentLogFilter === 'notable' && !['megaship_400m', 'quadjet', 'bizjet', 'vlcc_supertanker'].includes(r.category_key)) return false;
-    if (q) {
-      const hay = `${r.name_or_reg} ${r.target_id} ${r.secondary_id} ${r.badge} ${r.reason}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
 
-  document.getElementById('logbookCountLabel').textContent = `(${filtered.length} of ${rows.length} notable aircraft & vessels saved in TimescaleDB)`;
-  const tbody = document.getElementById('logbookTableBody');
-  if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6">No matching entries in logbook.</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = filtered.map(r => {
-    const icon = r.domain === 'ship' ? 'Ship' : 'Aircraft';
-    const mapBtn = (r.lat && r.lon)
-      ? `<button class="hl-link map-jump" onclick="locateOnMap('${r.domain}', '${r.target_id}', ${r.lat}, ${r.lon})">Map</button>`
-      : '';
-    const pubLinks = (r.links || []).slice(0, 2).map(l =>
-      `<a class="hl-link" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`
-    ).join(' ');
-    return `
+  if (currentTableTab === 'logbook') {
+    thead.innerHTML = `
       <tr>
-        <td class="mono">${icon}</td>
-        <td>
-          <b>${r.name_or_reg}</b>
-          <div style="font-size:0.72rem;color:var(--muted)" class="mono">${r.secondary_id || r.target_id}</div>
-        </td>
-        <td><span class="hl-badge">${r.badge}</span></td>
-        <td>
-          <div style="font-size:0.8rem;color:#e2e8f0">${r.reason}</div>
-          <div style="font-size:0.72rem;color:var(--muted)" class="mono">${r.metric_summary || ''}</div>
-        </td>
-        <td class="mono" style="font-size:0.74rem;color:var(--muted)">${r.last_seen_utc}</td>
-        <td><div style="display:flex;gap:5px;flex-wrap:wrap">${mapBtn} ${pubLinks}</div></td>
+        <th>Domain</th>
+        <th>Identifier / Name</th>
+        <th>Classification</th>
+        <th>Specifications &amp; Notes</th>
+        <th>Last Seen</th>
+        <th>Actions</th>
       </tr>
     `;
-  }).join('');
+    const rows = cachedMapData.highlights_log || [];
+    const filtered = rows.filter(r => {
+      if (currentLogFilter === 'ship' && r.domain !== 'ship') return false;
+      if (currentLogFilter === 'aircraft' && r.domain !== 'aircraft') return false;
+      if (currentLogFilter === 'notable' && !['megaship_400m', 'quadjet', 'bizjet', 'vlcc_supertanker'].includes(r.category_key)) return false;
+      if (q) {
+        const hay = `${r.name_or_reg} ${r.target_id} ${r.secondary_id} ${r.badge} ${r.reason}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    document.getElementById('logbookCountLabel').textContent = `${filtered.length} of ${rows.length} entries`;
+    if (filtered.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--ink-muted)">No matching entries in logbook.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = filtered.map(r => {
+      const domainLabel = r.domain === 'ship' ? 'Vessel' : 'Aircraft';
+      const mapBtn = (r.lat && r.lon)
+        ? `<button class="action-chip locate" onclick="locateOnMap('${r.domain}', '${r.target_id}', ${r.lat}, ${r.lon})">Locate</button>`
+        : '';
+      const pubLinks = (r.links || []).slice(0, 2).map(l =>
+        `<a class="action-chip" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`
+      ).join(' ');
+      return `
+        <tr>
+          <td class="num" style="color:var(--ink-muted)">${domainLabel}</td>
+          <td>
+            <div class="num" style="font-weight:600;color:var(--ink-strong)">${r.name_or_reg}</div>
+            <div class="num" style="font-size:0.7rem;color:var(--ink-faint)">${r.secondary_id || r.target_id}</div>
+          </td>
+          <td><span class="tag-spec">${r.badge}</span></td>
+          <td>
+            <div style="color:var(--ink)">${r.reason}</div>
+            <div class="num" style="font-size:0.7rem;color:var(--ink-muted)">${r.metric_summary || ''}</div>
+          </td>
+          <td class="num" style="font-size:0.73rem;color:var(--ink-muted)">${r.last_seen_utc}</td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap">${mapBtn} ${pubLinks}</div></td>
+        </tr>
+      `;
+    }).join('');
+  } else if (currentTableTab === 'aircraft') {
+    thead.innerHTML = `
+      <tr>
+        <th>ICAO Hex</th>
+        <th>Callsign</th>
+        <th>Registration &amp; Type</th>
+        <th>Altitude Band (ft)</th>
+        <th>Max Speed</th>
+        <th>Lookup</th>
+      </tr>
+    `;
+    const flights = (cachedAdsb.recent_flights || []).filter(f => {
+      if (!q) return true;
+      return `${f.hex} ${f.callsign} ${f.reg} ${f.type_code} ${f.type_desc}`.toLowerCase().includes(q);
+    });
+    document.getElementById('logbookCountLabel').textContent = `${flights.length} recent flights`;
+    tbody.innerHTML = flights.map(f => {
+      const lnk = (f.links || []).map(l => `<a class="action-chip" href="${l.url}" target="_blank">${l.label}</a>`).join(' ');
+      return `
+        <tr>
+          <td class="num" style="font-weight:600;color:var(--ink-strong)">${(f.hex || '').toUpperCase()}</td>
+          <td class="num">${f.callsign || '—'}</td>
+          <td><span class="num" style="color:var(--ink-strong)">${f.reg !== '—' ? f.reg : ''}</span> <span style="color:var(--ink-muted)">${f.type_desc || f.type_code || '—'}</span></td>
+          <td class="num">${f.min_alt ?? '—'} – ${f.max_alt ?? '—'}</td>
+          <td class="num">${f.max_gs ? f.max_gs + ' kt' : '—'}</td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap">${lnk}</div></td>
+        </tr>
+      `;
+    }).join('');
+  } else {
+    thead.innerHTML = `
+      <tr>
+        <th>MMSI</th>
+        <th>Vessel Name</th>
+        <th>Dimensions</th>
+        <th>Draught</th>
+        <th>Destination</th>
+        <th>Speed &amp; Lookup</th>
+      </tr>
+    `;
+    const vessels = (cachedAis.recent_vessels || []).filter(v => {
+      if (!q) return true;
+      return `${v.mmsi} ${v.shipname} ${v.destination}`.toLowerCase().includes(q);
+    });
+    document.getElementById('logbookCountLabel').textContent = `${vessels.length} recent vessels`;
+    tbody.innerHTML = vessels.map(v => {
+      const lnk = (v.links || []).slice(0, 2).map(l => `<a class="action-chip" href="${l.url}" target="_blank">${l.label}</a>`).join(' ');
+      return `
+        <tr>
+          <td class="num">${v.mmsi}</td>
+          <td class="num" style="font-weight:600;color:var(--ink-strong)">${v.shipname}</td>
+          <td class="num">${v.len_m ? v.len_m + 'm × ' + (v.beam_m || '—') + 'm' : '—'}</td>
+          <td class="num">${v.draught ? v.draught + 'm' : '—'}</td>
+          <td class="num" style="color:var(--ink-muted)">${v.destination}</td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap"><span class="num" style="margin-inline-end:6px">${v.speed ?? '—'} kt</span>${lnk}</div></td>
+        </tr>
+      `;
+    }).join('');
+  }
+}
+
+function renderTunnel(tun) {
+  tunnelState = tun || {enabled: false};
+  const dot = document.getElementById('tunnelDot');
+  const lbl = document.getElementById('tunnelLabel');
+  const link = document.getElementById('tunnelUrlLink');
+  const copyBtn = document.getElementById('tunnelCopyBtn');
+  const toggleBtn = document.getElementById('tunnelToggleBtn');
+
+  if (tun && tun.enabled) {
+    dot.className = 'dot live';
+    if (tun.url) {
+      lbl.textContent = 'Tunnel:';
+      link.style.display = 'inline';
+      link.href = tun.url;
+      link.textContent = tun.url.replace('https://', '');
+      copyBtn.style.display = 'inline-flex';
+    } else {
+      lbl.textContent = tun.status || 'Starting tunnel...';
+      link.style.display = 'none';
+      copyBtn.style.display = 'none';
+    }
+    toggleBtn.textContent = 'Stop';
+  } else {
+    dot.className = 'dot';
+    lbl.textContent = 'Quick Tunnel:';
+    link.style.display = 'none';
+    copyBtn.style.display = 'none';
+    toggleBtn.textContent = 'Share via Cloudflare';
+  }
+}
+
+async function toggleTunnel() {
+  const nextState = !(tunnelState && tunnelState.enabled);
+  document.getElementById('tunnelLabel').textContent = nextState ? 'Provisioning trycloudflare.com...' : 'Stopping...';
+  const res = await fetch('/api/tunnel', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: nextState, port: 8080})
+  });
+  const data = await res.json();
+  renderTunnel(data.tunnel);
+}
+
+function copyTunnelUrl() {
+  if (tunnelState && tunnelState.url) {
+    navigator.clipboard.writeText(tunnelState.url).catch(() => {});
+    const btn = document.getElementById('tunnelCopyBtn');
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = 'Copy URL'; }, 1500);
+  }
 }
 
 function buildAppUrl(m) {
@@ -1625,32 +2266,40 @@ async function fetchStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
   modesMeta = data.modes;
+  cachedAdsb = data.adsb || {};
+  cachedAis = data.ais || {};
   const sys = data.system;
   cyclerState = sys.cycler || {enabled: false, interval_sec: 120};
 
-  document.getElementById('usbName').textContent = sys.usb_connected ? 'Nooelec NESDR v5 Ready' : 'SDR Unplugged';
-  document.getElementById('usbDot').className = 'dot ' + (sys.usb_connected ? 'green' : 'amber');
-  document.getElementById('cpuTemp').textContent = sys.cpu_temp_c ? sys.cpu_temp_c + ' °C' : 'N/A';
+  document.getElementById('usbName').textContent = sys.usb_connected
+    ? 'Nooelec NESDR SMArt v5 · Raspberry Pi CM4 · TimescaleDB'
+    : 'USB SDR Unplugged · Raspberry Pi CM4';
+  document.getElementById('usbDot').className = 'dot ' + (sys.usb_connected ? 'live' : 'amber');
+  document.getElementById('cpuTemp').textContent = sys.cpu_temp_c ? sys.cpu_temp_c + '°C' : 'N/A';
   document.getElementById('lanIp').textContent = sys.lan_connected ? 'Connected' : 'Offline';
   const tsEl = document.getElementById('tsIp');
   if (sys.tailscale_connected) {
     tsEl.textContent = 'Connected';
   } else if (sys.tailscale_auth_url) {
-    tsEl.innerHTML = `<a href="${sys.tailscale_auth_url}" target="_blank" style="color:var(--accent)">Authenticate Tailscale</a>`;
+    tsEl.innerHTML = `<a href="${sys.tailscale_auth_url}" target="_blank" style="color:var(--accent)">Authenticate</a>`;
   } else {
     tsEl.textContent = sys.tailscale_status;
   }
 
+  renderTunnel(sys.tunnel);
   renderCycler(cyclerState, sys.active_mode);
 
   const activeName = sys.active_mode !== 'off' && modesMeta[sys.active_mode]
     ? modesMeta[sys.active_mode].title
-    : 'Standby (Tuner Free)';
-  document.getElementById('activeBanner').textContent = 'Hardware Tuner Assigned To: ' + activeName;
+    : 'Standby (Tuner Idle)';
+  document.getElementById('activeBanner').textContent = 'Active Hardware Lock: ' + activeName;
 
   renderModes(modesMeta, sys.modes_status);
-  renderHighlights(data.adsb, data.ais);
-  renderAnalytics(data.adsb, data.ais);
+  renderHighlights(cachedAdsb, cachedAis);
+  renderAnalytics(cachedAdsb, cachedAis);
+  if (currentTableTab !== 'logbook') {
+    renderActiveTable();
+  }
 }
 
 async function fetchMapAndLog() {
@@ -1658,14 +2307,15 @@ async function fetchMapAndLog() {
     const res = await fetch('/api/map');
     cachedMapData = await res.json();
     renderCombinedMap();
-    renderLogbookTable();
+    if (currentTableTab === 'logbook') {
+      renderActiveTable();
+    }
   } catch (e) {
     console.error('Map fetch error:', e);
   }
 }
 
 function renderCycler(cyc, activeMode) {
-  const bar = document.getElementById('cyclerBar');
   const dot = document.getElementById('cyclerDot');
   const head = document.getElementById('cyclerHeadline');
   const sub = document.getElementById('cyclerSub');
@@ -1678,19 +2328,17 @@ function renderCycler(cyc, activeMode) {
 
   const mins = Math.round((cyc.interval_sec || 120) / 60);
   if (cyc.enabled) {
-    bar.classList.add('active-cycle');
-    dot.className = 'dot green';
-    head.textContent = `Auto-Cycling ADS-B / Marine AIS (${mins} min each · Active)`;
-    sub.innerHTML = `Currently capturing: <b>${(activeMode || cyc.current_target).toUpperCase()}</b> · Next switch to <b>${(cyc.next_target || '').toUpperCase()}</b> in <b>${cyc.seconds_remaining ?? '--'}s</b> (Completed cycles: ${cyc.cycles_completed || 0})`;
-    btn.textContent = 'Pause Auto-Cycler';
-    btn.className = 'btn btn-activate';
+    dot.className = 'dot live';
+    head.textContent = `Dual-Band Auto-Cycler (${mins}m window · Active)`;
+    sub.innerHTML = `Active receiver: <strong class="num" style="color:var(--ink-strong)">${(activeMode || cyc.current_target).toUpperCase()}</strong> · Next switch to <strong class="num" style="color:var(--ink-strong)">${(cyc.next_target || '').toUpperCase()}</strong> in <span class="num">${cyc.seconds_remaining ?? '--'}s</span> (${cyc.cycles_completed || 0} cycles completed)`;
+    btn.textContent = 'Pause Cycler';
+    btn.className = 'btn';
   } else {
-    bar.classList.remove('active-cycle');
     dot.className = 'dot amber';
-    head.textContent = `Dual-Band Auto-Cycler (Paused — Single Mode Locked: ${activeMode.toUpperCase()})`;
-    sub.textContent = `Enable to automatically alternate between ADS-B (1090 MHz) and Marine AIS (162 MHz) every ${mins} minutes.`;
-    btn.textContent = 'Start ADS-B / AIS Auto-Cycle';
-    btn.className = 'btn btn-open';
+    head.textContent = `Dual-Band Auto-Cycler (Paused · Locked to ${activeMode.toUpperCase()})`;
+    sub.textContent = `Tuner dedicated to single receiver. Enable cycler to alternate 1090 MHz ADS-B and 162 MHz AIS every ${mins} minutes.`;
+    btn.textContent = 'Resume Auto-Cycler';
+    btn.className = 'btn btn-primary';
   }
 }
 
@@ -1718,18 +2366,18 @@ function renderHighlights(adsb, ais) {
   const planesBox = document.getElementById('topPlanesContainer');
   const planes = adsb.top_interesting_planes || [];
   if (planes.length === 0) {
-    planesBox.innerHTML = '<div class="highlight-card">No aircraft highlights yet.</div>';
+    planesBox.innerHTML = '<div class="ins-row"><span class="ins-desc">No notable aircraft recorded yet.</span></div>';
   } else {
-    planesBox.innerHTML = planes.map((p, i) => `
-      <div class="highlight-card">
-        <div class="hl-top">
-          <span class="hl-name">#${i + 1} · ${p.callsign !== '—' ? p.callsign : p.hex} (${p.reg})</span>
-          <span class="hl-badge">${p.badge}</span>
+    planesBox.innerHTML = planes.map(p => `
+      <div class="ins-row">
+        <div class="ins-head">
+          <span class="ins-name">${p.callsign !== '—' ? p.callsign : p.hex} (${p.reg})</span>
+          <span class="tag-spec">${p.badge}</span>
         </div>
-        <div class="hl-reason">${p.reason}</div>
-        <div class="hl-links">
-          <button class="hl-link map-jump" onclick="locateOnMap('aircraft', '${p.hex}', null, null)">Locate on Map</button>
-          ${(p.links || []).map(l => `<a class="hl-link" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`).join('')}
+        <div class="ins-desc">${p.reason}</div>
+        <div class="ins-actions">
+          <button class="action-chip locate" onclick="locateOnMap('aircraft', '${p.hex}', null, null)">Locate</button>
+          ${(p.links || []).map(l => `<a class="action-chip" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`).join('')}
         </div>
       </div>
     `).join('');
@@ -1738,18 +2386,18 @@ function renderHighlights(adsb, ais) {
   const shipsBox = document.getElementById('topShipsContainer');
   const ships = ais.top_interesting_ships || [];
   if (ships.length === 0) {
-    shipsBox.innerHTML = '<div class="highlight-card">No ship highlights yet.</div>';
+    shipsBox.innerHTML = '<div class="ins-row"><span class="ins-desc">No notable vessels recorded yet.</span></div>';
   } else {
-    shipsBox.innerHTML = ships.map((s, i) => `
-      <div class="highlight-card">
-        <div class="hl-top">
-          <span class="hl-name">#${i + 1} · ${s.shipname}</span>
-          <span class="hl-badge">${s.badge}</span>
+    shipsBox.innerHTML = ships.map(s => `
+      <div class="ins-row">
+        <div class="ins-head">
+          <span class="ins-name">${s.shipname}</span>
+          <span class="tag-spec">${s.badge}</span>
         </div>
-        <div class="hl-reason">${s.reason}</div>
-        <div class="hl-links">
-          ${(s.lat && s.lon) ? `<button class="hl-link map-jump" onclick="locateOnMap('ship', '${s.mmsi}', ${s.lat}, ${s.lon})">Locate on Map</button>` : `<span class="hl-link" style="opacity:0.75;cursor:default">Static AIS Only</span>`}
-          ${(s.links || []).map(l => `<a class="hl-link" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`).join('')}
+        <div class="ins-desc">${s.reason}</div>
+        <div class="ins-actions">
+          ${(s.lat && s.lon) ? `<button class="action-chip locate" onclick="locateOnMap('ship', '${s.mmsi}', ${s.lat}, ${s.lon})">Locate</button>` : `<span class="action-chip" style="opacity:0.6;cursor:default">Static Only</span>`}
+          ${(s.links || []).map(l => `<a class="action-chip" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`).join('')}
         </div>
       </div>
     `).join('');
@@ -1763,32 +2411,30 @@ function renderModes(modes, statusMap) {
     const isAct = !!statusMap[id];
     const url = buildAppUrl(m);
     const card = document.createElement('div');
-    card.className = 'mode-card' + (isAct ? ' active' : '');
+    card.className = 'mode-card';
+    card.setAttribute('data-active', isAct ? 'true' : 'false');
     card.innerHTML = `
-      <div>
-        <div class="mode-head">
-          <div class="mode-title"><span>[${m.icon}]</span> <span>${m.title}</span></div>
-          <span class="status-tag ${isAct ? 'on' : 'off'}">
-            <span class="dot ${isAct ? 'green' : ''}"></span>
-            ${isAct ? 'ACTIVE ON SDR' : 'STANDBY'}
-          </span>
+      <div class="mode-top">
+        <div>
+          <div class="mode-name">${m.title}</div>
+          <div class="mode-freq">${m.badge} · ${m.stack}</div>
         </div>
-        <div style="margin-bottom:8px"><span class="freq-badge">${m.badge}</span></div>
-        <div class="mode-desc">${m.description}</div>
+        <span class="mode-state ${isAct ? 'on' : ''}">
+          <span class="dot ${isAct ? 'live' : ''}"></span>
+          ${isAct ? 'Active' : 'Standby'}
+        </span>
       </div>
-      <div>
-        <div class="mode-meta">
-          <div><b>Stack:</b> ${m.stack}</div>
-          <div><b>Endpoints:</b> ${m.PortLabel}</div>
-        </div>
-        <div class="btn-row">
+      <div class="mode-body">${m.description}</div>
+      <div class="mode-foot">
+        <span class="mode-endpoint" title="${m.PortLabel}">${m.PortLabel}</span>
+        <div style="display:flex;gap:0.4rem">
           ${isAct
-            ? `<button class="btn btn-active" disabled>Tuner Assigned</button>`
-            : `<button class="btn btn-activate" onclick="switchMode('${id}')">Lock Mode</button>`
+            ? `<button class="btn" disabled>Assigned</button>`
+            : `<button class="btn" onclick="switchMode('${id}')">Lock Tuner</button>`
           }
           ${url
-            ? `<a class="btn btn-open" href="${url}" target="_blank">Open Web UI</a>`
-            : `<button class="btn btn-activate" onclick="copyEndpoint('${id}', ${m.port})">Copy ${host}:${m.port}</button>`
+            ? `<a class="btn btn-primary" href="${url}" target="_blank" rel="noopener">Open UI</a>`
+            : `<button class="btn btn-subtle" onclick="copyEndpoint('${id}', ${m.port})">Copy :${m.port}</button>`
           }
         </div>
       </div>
@@ -1800,13 +2446,13 @@ function renderModes(modes, statusMap) {
 function copyEndpoint(id, port) {
   const txt = host + ':' + port;
   navigator.clipboard.writeText(txt).catch(() => {});
-  alert('Connect your SDR client (e.g. SDR++ or Gqrx) to: ' + txt);
+  alert('Connect your SDR client (SDR++ or Gqrx) to: ' + txt);
 }
 
 async function switchMode(modeId) {
   if (switching) return;
   switching = true;
-  document.getElementById('activeBanner').textContent = 'Switching radio hardware to ' + modeId.toUpperCase() + '...';
+  document.getElementById('activeBanner').textContent = 'Assigning hardware tuner to ' + modeId.toUpperCase() + '...';
   try {
     await fetch('/api/mode', {
       method: 'POST',
@@ -1821,54 +2467,14 @@ async function switchMode(modeId) {
 
 function renderAnalytics(adsb, ais) {
   document.getElementById('stAdsbPos').textContent = (adsb.total_positions || 0).toLocaleString();
-  document.getElementById('stAdsbAc').textContent = `${adsb.unique_aircraft || 0} unique aircraft · ${adsb.total_flights || 0} flights`;
+  document.getElementById('stAdsbAc').textContent = `${adsb.unique_aircraft || 0} aircraft · ${adsb.total_flights || 0} flights`;
   document.getElementById('stAdsbRange').textContent = adsb.max_altitude_ft ? `${adsb.max_altitude_ft.toLocaleString()} ft` : '—';
-  document.getElementById('stAdsbAlt').textContent = `Avg RSSI: ${adsb.avg_rssi_dbfs ?? '—'} dBFS · Max speed: ${adsb.max_speed_kt ?? '—'} kt`;
+  document.getElementById('stAdsbAlt').textContent = `${adsb.avg_rssi_dbfs ?? '—'} dBFS · ${adsb.max_speed_kt ?? '—'} kt`;
 
   document.getElementById('stAisVessels').textContent = (ais.unique_vessels || 0).toLocaleString();
-  document.getElementById('stAisNamed').textContent = `${ais.named_vessels || 0} with decoded static vessel name`;
-  document.getElementById('stAisMsgs').textContent = (ais.total_messages || 0).toLocaleString() + ' msgs';
-  document.getElementById('stDbSize').textContent = `TimescaleDB Size: ${ais.timescaledb_size || '—'} (~65% smaller than SQLite)`;
-
-  const adsbBody = document.getElementById('adsbTableBody');
-  const flights = adsb.recent_flights || [];
-  if (flights.length === 0) {
-    adsbBody.innerHTML = '<tr><td colspan="6">No aircraft logged yet.</td></tr>';
-  } else {
-    adsbBody.innerHTML = flights.slice(0, 12).map(f => {
-      const firstLink = (f.links && f.links[0]) ? `<a class="hl-link" href="${f.links[0].url}" target="_blank">Track</a>` : '—';
-      return `
-        <tr>
-          <td class="mono"><b>${(f.hex || '').toUpperCase()}</b></td>
-          <td class="mono">${f.callsign || '—'}</td>
-          <td>${f.reg !== '—' ? `<b>${f.reg}</b> · ` : ''}${f.type_code || '—'}</td>
-          <td>${f.min_alt ?? '—'}..${f.max_alt ?? '—'}</td>
-          <td>${f.samples || 1}</td>
-          <td>${firstLink}</td>
-        </tr>
-      `;
-    }).join('');
-  }
-
-  const aisBody = document.getElementById('aisTableBody');
-  const vessels = ais.recent_vessels || [];
-  if (vessels.length === 0) {
-    aisBody.innerHTML = '<tr><td colspan="6">No vessels logged yet.</td></tr>';
-  } else {
-    aisBody.innerHTML = vessels.slice(0, 12).map(v => {
-      const firstLink = (v.links && v.links[0]) ? `<a class="hl-link" href="${v.links[0].url}" target="_blank">Vessel</a>` : '—';
-      return `
-        <tr>
-          <td class="mono">${v.mmsi}</td>
-          <td><b>${v.shipname}</b></td>
-          <td class="mono">${v.len_m ? v.len_m + 'm' : '—'}</td>
-          <td>${v.destination}</td>
-          <td>${v.speed !== null && v.speed !== undefined ? v.speed + ' kt' : '—'}</td>
-          <td>${firstLink}</td>
-        </tr>
-      `;
-    }).join('');
-  }
+  document.getElementById('stAisNamed').textContent = `${ais.named_vessels || 0} named vessels`;
+  document.getElementById('stDbSize').textContent = ais.timescaledb_size || '—';
+  document.getElementById('stAisMsgs').textContent = (ais.total_messages || 0).toLocaleString() + ' AIS msgs';
 }
 
 fetchStatus();
@@ -2012,6 +2618,14 @@ class LauncherHandler(BaseHTTPRequestHandler):
             interval = body.get("interval_sec")
             result = CYCLER.configure(enabled=en, interval_sec=interval)
             self._send_json({"ok": True, "cycler": result})
+        elif parsed.path == "/api/tunnel":
+            en = bool(body.get("enabled", False))
+            target_port = int(body.get("port", PORT))
+            if en:
+                t_status = TUNNEL.start(target_port=target_port)
+            else:
+                t_status = TUNNEL.stop()
+            self._send_json({"ok": True, "tunnel": t_status})
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 

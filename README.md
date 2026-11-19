@@ -31,6 +31,7 @@ Read the full technical build write-up in [`doc/README.md`](doc/README.md).
 3. Open the web launcher:
    - LAN: `http://<your-pi-host>:8080/`
    - Tailscale: `http://<your-tailscale-host>:8080/`
+   - Temporary Public Share Link (Cloudflare Quick Tunnel, no account required): Click **Share via Cloudflare** in the console top bar (or run `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080`) to provision a temporary `https://<random-words>.trycloudflare.com` link on demand.
 
 ## Installed Services
 
