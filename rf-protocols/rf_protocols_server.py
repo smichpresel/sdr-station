@@ -26,6 +26,8 @@ import subprocess
 import threading
 import time
 import urllib.request
+import wave
+import zlib
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -40,6 +42,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("RF_PROTOCOLS_PORT", "8434"))
 PG_DSN = os.environ.get("SDR_PG_DSN", "dbname=sdr_station")
 STATE_FILE = Path(os.environ.get("RF_PROTOCOLS_STATE_FILE", str(BASE_DIR / "data" / "rf_protocols_state.json")))
+WX_CAPTURE_DIR = Path(os.environ.get("WX_CAPTURE_DIR", str(BASE_DIR / "data" / "wx_sat")))
 
 PROTOCOL_PROFILES = {
     "acars": {
@@ -299,11 +302,78 @@ def compute_upcoming_wx_passes(open_sky_sector: str = "S") -> list[dict]:
     return passes
 
 
-APRS_POS_RE = re.compile(r"([0-9]{4}\.[0-9]{2})([NS])[/\\]([0-9]{5}\.[0-9]{2})([EW])")
+def _write_grayscale_png(path: Path, width: int, height: int, rows: list[bytes]):
+    """Pure-Python 8-bit grayscale PNG writer using stdlib zlib (zero external deps)."""
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    raw = b"".join(b"\x00" + r[:width].ljust(width, b"\x00") for r in rows[:height])
+    idat = zlib.compress(raw, 6)
+    png_bytes = b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(png_bytes)
+
+
+def decode_apt_pcm_to_png(pcm_samples: list[int], sample_rate: int, png_path: Path) -> bool:
+    """
+    Demodulates a 11,025 Hz NOAA APT 2400 Hz AM subcarrier audio recording into a
+    2-lines-per-second (1040 px wide) grayscale PNG satellite image.
+    """
+    samples_per_line = sample_rate // 2  # 5512.5 samples per 0.5s APT line
+    width = 1040
+    total_lines = len(pcm_samples) // int(samples_per_line)
+    if total_lines < 20:
+        return False
+
+    # 2400 Hz AM envelope extraction + resampling to 1040 pixels per 0.5s line
+    raw_lines = []
+    min_v = 32767.0
+    max_v = 1.0
+    for line_idx in range(total_lines):
+        base = int(line_idx * samples_per_line)
+        line_vals = []
+        for px in range(width):
+            s_idx = base + int((px / width) * samples_per_line)
+            window = pcm_samples[s_idx : min(len(pcm_samples), s_idx + 6)]
+            env = max((abs(v) for v in window), default=0)
+            if env < min_v:
+                min_v = float(env)
+            if env > max_v:
+                max_v = float(env)
+            line_vals.append(env)
+        raw_lines.append(line_vals)
+
+    span = max(1.0, max_v - min_v)
+    byte_rows = [
+        bytes(max(0, min(255, int(((v - min_v) / span) * 255))) for v in row)
+        for row in raw_lines
+    ]
+    _write_grayscale_png(png_path, width, len(byte_rows), byte_rows)
+    return True
+
+
+def get_wx_captures(limit: int = 25) -> list[dict]:
+    WX_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    items = []
+    for p in sorted(WX_CAPTURE_DIR.glob("*.png"), key=lambda x: x.stat().st_mtime, reverse=True)[:limit]:
+        wav_p = p.with_suffix(".wav")
+        st = p.stat()
+        items.append(
+            {
+                "name": p.stem,
+                "png_url": f"/captures/{p.name}",
+                "wav_url": f"/captures/{wav_p.name}" if wav_p.exists() else None,
+                "size_kb": round(st.st_size / 1024.0, 1),
+                "wav_size_kb": round(wav_p.stat().st_size / 1024.0, 1) if wav_p.exists() else 0,
+                "captured_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+        )
+    return items
 
 
 def _parse_aprs_coords(payload: str) -> tuple[float | None, float | None]:
-    m = APRS_POS_RE.search(payload or "")
+    m = re.search(r"([0-9]{4}\.[0-9]{2})([NS])[/\\]([0-9]{5}\.[0-9]{2})([EW])", payload or "")
     if not m:
         return (None, None)
     try:
@@ -524,12 +594,95 @@ class MultiProtocolEngine:
         self._monitor_pcm_bursts(proc, "dsc", freqs[0], "VHF Ch 70 DSC 1200bd AFSK Frame", threshold_rms=1100)
 
     def _run_wx_sat(self, freqs: list[str], gain: str):
-        cmd = ["rtl_fm", "-M", "fm", "-s", "48000", "-r", "11025", "-g", gain, "-f", freqs[0]]
-        self.status_line = f"Receiving 137 MHz Weather Satellite APT telemetry on {freqs[0]}"
+        WX_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        freq = freqs[0]
+        sample_rate = 11025
+        cmd = ["rtl_fm", "-M", "fm", "-s", "48000", "-r", str(sample_rate), "-g", gain, "-f", freq]
+        self.status_line = f"Receiving & recording 137 MHz Weather Satellite APT pass on {freq}"
         with self.lock:
             self.rtl_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             proc = self.rtl_proc
-        self._monitor_pcm_bursts(proc, "wx_sat", freqs[0], "137 MHz APT 2400 Hz Subcarrier Frame", threshold_rms=1400)
+
+        ts_slug = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        freq_slug = freq.replace(".", "_").replace("M", "")
+        base_name = f"wx_{freq_slug}_{ts_slug}"
+        wav_path = WX_CAPTURE_DIR / f"{base_name}.wav"
+        png_path = WX_CAPTURE_DIR / f"{base_name}.png"
+
+        pcm_accum: list[int] = []
+        last_decode_ts = time.time()
+        last_log_ts = 0.0
+        peak_dbfs = -90.0
+
+        try:
+            while self.running and proc.poll() is None and proc.stdout is not None:
+                buf = proc.stdout.read(4410)  # 0.2s of 16-bit PCM at 11,025 Hz
+                if not buf or len(buf) < 512:
+                    break
+                n = len(buf) // 2
+                samples = struct.unpack(f"<{n}h", buf[: n * 2])
+                sq_sum = sum(s * s for s in samples)
+                rms = math.sqrt(sq_sum / max(1, n))
+                dbfs = round(20.0 * math.log10(max(1.0, rms) / 32768.0), 1)
+                if dbfs > peak_dbfs:
+                    peak_dbfs = dbfs
+
+                # Accumulate audio whenever carrier/subcarrier energy exceeds floor
+                if rms >= 650:
+                    pcm_accum.extend(samples)
+                    if (time.time() - last_log_ts) >= 20.0:
+                        last_log_ts = time.time()
+                        dur_s = round(len(pcm_accum) / sample_rate, 1)
+                        log_packet(
+                            "wx_sat",
+                            freq,
+                            "NOAA / METEOR APT",
+                            base_name,
+                            "APT 2400 Hz Subcarrier",
+                            f"Recording satellite pass ({dur_s}s buffered, {dbfs} dBFS) -> /captures/{png_path.name}",
+                            signal_db=dbfs,
+                        )
+
+                # Periodically flush .wav and decode .png every 30s if we have >= 12s of pass audio
+                if len(pcm_accum) >= sample_rate * 12 and (time.time() - last_decode_ts) >= 30.0:
+                    last_decode_ts = time.time()
+                    self._flush_wx_recording(pcm_accum, sample_rate, wav_path, png_path, freq, peak_dbfs)
+        finally:
+            if len(pcm_accum) >= sample_rate * 10:
+                self._flush_wx_recording(pcm_accum, sample_rate, wav_path, png_path, freq, peak_dbfs, final=True)
+
+    def _flush_wx_recording(
+        self,
+        pcm_accum: list[int],
+        sample_rate: int,
+        wav_path: Path,
+        png_path: Path,
+        freq: str,
+        peak_dbfs: float,
+        final: bool = False,
+    ):
+        try:
+            WX_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+            raw_pcm = struct.pack(f"<{len(pcm_accum)}h", *pcm_accum)
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(raw_pcm)
+            ok = decode_apt_pcm_to_png(pcm_accum, sample_rate, png_path)
+            if ok and final:
+                dur_s = round(len(pcm_accum) / sample_rate, 1)
+                log_packet(
+                    "wx_sat",
+                    freq,
+                    "NOAA / METEOR APT",
+                    png_path.name,
+                    "Saved APT Pass Image",
+                    f"Saved {dur_s}s satellite pass recording ({wav_path.name}) & decoded APT image (/captures/{png_path.name})",
+                    signal_db=peak_dbfs,
+                )
+        except Exception as e:
+            print(f"[wx-sat] Save recording error: {e}", flush=True)
 
     def _monitor_pcm_bursts(self, proc: subprocess.Popen, proto: str, freq: str, label: str, threshold_rms: int = 1000):
         """
@@ -863,9 +1016,23 @@ class Handler(BaseHTTPRequestHandler):
                     "profiles": PROTOCOL_PROFILES,
                     "counts": get_protocol_counts(),
                     "wx_passes": compute_upcoming_wx_passes(),
+                    "wx_captures": get_wx_captures(),
                     "packets": get_recent_packets(proto_flt),
                 }
             )
+        elif parsed.path.startswith("/captures/"):
+            fname = Path(parsed.path.removeprefix("/captures/")).name
+            fpath = WX_CAPTURE_DIR / fname
+            if fpath.exists() and fpath.is_file():
+                raw = fpath.read_bytes()
+                ctype = "image/png" if fname.endswith(".png") else ("audio/wav" if fname.endswith(".wav") else "application/octet-stream")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 

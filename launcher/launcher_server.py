@@ -39,16 +39,21 @@ sys.path.insert(0, str(BASE_DIR / "sanctions-sync"))
 sys.path.insert(0, str(BASE_DIR / "rf-protocols"))
 try:
     from rf_protocols_server import (
+        WX_CAPTURE_DIR,
         compute_upcoming_wx_passes,
         get_protocol_counts,
         get_recent_packets as get_recent_rf_packets,
+        get_wx_captures,
     )
 except Exception:
-    def compute_upcoming_wx_passes():
+    WX_CAPTURE_DIR = BASE_DIR / "data" / "wx_sat"
+    def compute_upcoming_wx_passes(open_sky_sector="S"):
         return []
     def get_protocol_counts():
         return {}
     def get_recent_rf_packets(protocol=None, limit=80):
+        return []
+    def get_wx_captures(limit=25):
         return []
 try:
     from opensanctions_sync import (
@@ -3541,9 +3546,23 @@ class LauncherHandler(BaseHTTPRequestHandler):
                 {
                     "counts": get_protocol_counts(),
                     "wx_passes": compute_upcoming_wx_passes(),
+                    "wx_captures": get_wx_captures(),
                     "packets": get_recent_rf_packets(limit=80),
                 }
             )
+        elif parsed.path.startswith("/captures/"):
+            fname = Path(parsed.path.removeprefix("/captures/")).name
+            fpath = WX_CAPTURE_DIR / fname
+            if fpath.exists() and fpath.is_file():
+                raw = fpath.read_bytes()
+                ctype = "image/png" if fname.endswith(".png") else ("audio/wav" if fname.endswith(".wav") else "application/octet-stream")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
         elif parsed.path == "/api/highlights/export.csv":
             buf = io.StringIO()
             try:
