@@ -35,6 +35,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "adsb-analytics"))
 sys.path.insert(0, str(BASE_DIR / "ais-analytics"))
 sys.path.insert(0, str(BASE_DIR / "sanctions-sync"))
+sys.path.insert(0, str(BASE_DIR / "rf-protocols"))
+try:
+    from rf_protocols_server import (
+        compute_upcoming_wx_passes,
+        get_protocol_counts,
+        get_recent_packets as get_recent_rf_packets,
+    )
+except Exception:
+    def compute_upcoming_wx_passes():
+        return []
+    def get_protocol_counts():
+        return {}
+    def get_recent_rf_packets(protocol=None, limit=80):
+        return []
 try:
     from opensanctions_sync import (
         get_watchlist_cache,
@@ -151,6 +165,21 @@ EXCLUSIVE_MODES = {
         "description": (
             "Decodes wireless sensor protocols on 433.92 MHz including weather stations, "
             "tire pressure sensors (TPMS), and utility telemetry."
+        ),
+    },
+    "rfprotocols": {
+        "id": "rfprotocols",
+        "service": "sdr-rf-protocols.service",
+        "title": "ACARS, DSC, APRS, Pager & WX Sat",
+        "badge": "131–174 MHz · ACARS / DSC / APRS / POCSAG / APT",
+        "icon": "rfprotocols",
+        "port": 8434,
+        "path": "/",
+        "PortLabel": ":8434 (Multi-Protocol Decoder & Pass Table)",
+        "stack": "acarsdec + multimon-ng + direwolf + TimescaleDB",
+        "description": (
+            "Decodes ACARS cockpit text messages (131.55 MHz), Marine VHF Ch 70 DSC (156.525 MHz), "
+            "2m APRS packets (144.80 MHz), POCSAG/FLEX pagers, and 137 MHz NOAA/Meteor satellite passes."
         ),
     },
     "rtltcp": {
@@ -2208,6 +2237,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="segmented" role="tablist" aria-label="Dataset view">
           <button class="seg-btn active" id="tabBtnLogbook" onclick="switchTableTab('logbook')">Saved Notable Logbook</button>
           <button class="seg-btn" id="tabBtnSts" onclick="switchTableTab('sts')">STS &amp; Loitering</button>
+          <button class="seg-btn" id="tabBtnProtocols" onclick="switchTableTab('protocols')">RF Protocols &amp; WX Sat</button>
           <button class="seg-btn" id="tabBtnAircraft" onclick="switchTableTab('aircraft')">Recent Aircraft (adsb_flights)</button>
           <button class="seg-btn" id="tabBtnVessels" onclick="switchTableTab('vessels')">Recent Vessels (ais_state)</button>
         </div>
@@ -2267,6 +2297,7 @@ let cachedMapData = {station: {}, aircraft: [], ships: [], highlights_log: []};
 let cachedAdsb = {};
 let cachedAis = {};
 let cachedSts = [];
+let cachedProtocols = {packets: [], wx_passes: [], counts: {}};
 let currentMapFilter = 'all';
 let currentLogFilter = 'all';
 let currentTableTab = 'logbook';
@@ -2586,6 +2617,7 @@ async function switchTableTab(tab) {
   currentTableTab = tab;
   document.getElementById('tabBtnLogbook').classList.toggle('active', tab === 'logbook');
   document.getElementById('tabBtnSts').classList.toggle('active', tab === 'sts');
+  document.getElementById('tabBtnProtocols').classList.toggle('active', tab === 'protocols');
   document.getElementById('tabBtnAircraft').classList.toggle('active', tab === 'aircraft');
   document.getElementById('tabBtnVessels').classList.toggle('active', tab === 'vessels');
   document.getElementById('logSubFilters').style.display = tab === 'logbook' ? 'inline-flex' : 'none';
@@ -2594,6 +2626,11 @@ async function switchTableTab(tab) {
       const res = await fetch('/api/sts');
       const data = await res.json();
       cachedSts = data.events || [];
+    } catch (e) {}
+  } else if (tab === 'protocols') {
+    try {
+      const res = await fetch('/api/protocols');
+      cachedProtocols = await res.json();
     } catch (e) {}
   }
   renderActiveTable();
@@ -2712,6 +2749,48 @@ function renderActiveTable() {
         </tr>
       `;
     }).join('');
+  } else if (currentTableTab === 'protocols') {
+    thead.innerHTML = `
+      <tr>
+        <th>Protocol / Orbit</th>
+        <th>Frequency</th>
+        <th>Sender / Satellite</th>
+        <th>Channel / Mode</th>
+        <th>Decoded Frame / Next Orbital Pass</th>
+        <th>Timestamp / AOS</th>
+      </tr>
+    `;
+    const pkts = (cachedProtocols.packets || []).filter(p => {
+      if (!q) return true;
+      return `${p.protocol} ${p.freq} ${p.sender} ${p.summary}`.toLowerCase().includes(q);
+    });
+    const passes = (cachedProtocols.wx_passes || []).filter(w => {
+      if (!q) return true;
+      return `${w.satellite} ${w.freq} ${w.mode}`.toLowerCase().includes(q);
+    });
+    document.getElementById('logbookCountLabel').textContent =
+      `${pkts.length} decoded frames · ${passes.length} upcoming 137 MHz passes`;
+    const passRows = passes.map(w => `
+      <tr>
+        <td><span class="tag-spec">WX SAT PASS</span></td>
+        <td class="num" style="color:var(--accent)">${w.freq}</td>
+        <td class="num" style="font-weight:600;color:var(--ink-strong)">${w.satellite} (NORAD ${w.norad})</td>
+        <td><span class="tag-spec">${w.mode}</span></td>
+        <td>Upcoming pass in <strong class="num">${w.in_minutes}m</strong> · Max Elevation <strong class="num">${w.max_elevation_deg}°</strong> (${w.duration_min}m window)</td>
+        <td class="num" style="font-size:0.73rem;color:var(--ink-muted)">${w.aos_utc}</td>
+      </tr>
+    `).join('');
+    const pktRows = pkts.map(p => `
+      <tr>
+        <td><span class="tag-spec">${(p.protocol || '').toUpperCase()}</span></td>
+        <td class="num">${p.freq}</td>
+        <td class="num" style="font-weight:600;color:var(--ink-strong)">${p.sender || '—'}</td>
+        <td><span class="tag-spec">${p.channel_or_label || p.target || '—'}</span></td>
+        <td class="num">${p.summary}</td>
+        <td class="num" style="font-size:0.73rem;color:var(--ink-muted)">${p.ts_utc}</td>
+      </tr>
+    `).join('');
+    tbody.innerHTML = (pktRows + passRows) || '<tr><td colspan="6" style="color:var(--ink-muted)">No RF protocol frames recorded yet.</td></tr>';
   } else if (currentTableTab === 'aircraft') {
     thead.innerHTML = `
       <tr>
@@ -3152,6 +3231,14 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self._send_json({"count": len(events), "events": events})
         elif parsed.path == "/api/sanctions/status":
             self._send_json(get_watchlist_cache()["stats"])
+        elif parsed.path == "/api/protocols":
+            self._send_json(
+                {
+                    "counts": get_protocol_counts(),
+                    "wx_passes": compute_upcoming_wx_passes(),
+                    "packets": get_recent_rf_packets(limit=80),
+                }
+            )
         elif parsed.path == "/api/highlights/export.csv":
             buf = io.StringIO()
             try:

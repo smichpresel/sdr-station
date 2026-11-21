@@ -1,0 +1,15 @@
+[Unit]
+Description=SDR Multi-Protocol RF Datalink & Satellite Decoder (ACARS, DSC, APRS, POCSAG, WX Sat)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/sdr-station/rf-protocols
+EnvironmentFile=-/etc/default/sdr-station
+ExecStart=/usr/bin/python3 /opt/sdr-station/rf-protocols/rf_protocols_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
