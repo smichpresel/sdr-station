@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import psycopg2
 import psycopg2.extras
@@ -377,6 +377,8 @@ def init_spotter_db():
                     );
                     CREATE INDEX IF NOT EXISTS idx_spotter_highlights_score
                         ON spotter_highlights (score DESC, last_seen DESC);
+                    CREATE INDEX IF NOT EXISTS idx_ais_archive_mmsi_ts
+                        ON ais_archive_ts (mmsi, received_at DESC);
                     """
                 )
         conn.close()
@@ -1212,6 +1214,179 @@ def get_combined_map_and_log() -> dict:
     }
 
 
+def get_target_track(domain: str, target_id: str, hours: int = 24) -> dict:
+    """
+    Query historical trajectory polylines for an aircraft (adsb_positions)
+    or vessel (ais_archive_ts + ais_position/ais_message) from TimescaleDB.
+    """
+    domain = (domain or "").strip().lower()
+    target_id = (target_id or "").strip()
+    hours = max(1, min(int(hours or 24), 168))
+    points = []
+
+    if not target_id:
+        return {"domain": domain, "target_id": target_id, "points": []}
+
+    try:
+        conn = psycopg2.connect(PG_DSN)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if domain == "aircraft":
+                cur.execute(
+                    """
+                    SELECT
+                        ROUND(lat::numeric, 5)::float AS lat,
+                        ROUND(lon::numeric, 5)::float AS lon,
+                        alt_baro,
+                        ROUND(gs::numeric, 1)::float AS gs,
+                        ROUND(track::numeric, 1)::float AS heading,
+                        ts
+                    FROM adsb_positions
+                    WHERE LOWER(hex) = LOWER(%s)
+                      AND lat IS NOT NULL AND lon IS NOT NULL
+                      AND ts >= NOW() - (%s || ' hours')::interval
+                    ORDER BY ts ASC
+                    LIMIT 900
+                    """,
+                    (target_id, str(hours)),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    cur.execute(
+                        """
+                        SELECT
+                            ROUND(lat::numeric, 5)::float AS lat,
+                            ROUND(lon::numeric, 5)::float AS lon,
+                            alt_baro,
+                            ROUND(gs::numeric, 1)::float AS gs,
+                            ROUND(track::numeric, 1)::float AS heading,
+                            ts
+                        FROM adsb_positions
+                        WHERE LOWER(hex) = LOWER(%s)
+                          AND lat IS NOT NULL AND lon IS NOT NULL
+                        ORDER BY ts ASC
+                        LIMIT 900
+                        """,
+                        (target_id,),
+                    )
+                    rows = cur.fetchall()
+                for r in rows:
+                    points.append(
+                        {
+                            "lat": r["lat"],
+                            "lon": r["lon"],
+                            "alt_baro": r["alt_baro"],
+                            "speed": r["gs"],
+                            "heading": r["heading"],
+                            "ts_utc": r["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if r.get("ts") else "—",
+                        }
+                    )
+            elif domain == "ship":
+                mmsi_int = int(target_id)
+                cur.execute(
+                    """
+                    WITH raw_pts AS (
+                        SELECT
+                            received_at AS ts,
+                            ROUND(lat::numeric, 5)::float AS lat,
+                            ROUND(lon::numeric, 5)::float AS lon,
+                            ROUND(speed::numeric, 1)::float AS speed,
+                            ROUND(course::numeric, 1)::float AS heading
+                        FROM ais_archive_ts
+                        WHERE mmsi = %s
+                          AND lat IS NOT NULL AND lon IS NOT NULL
+                          AND lat BETWEEN -85 AND 85 AND lon BETWEEN -180 AND 180
+                          AND (lat != 0 OR lon != 0)
+                        UNION ALL
+                        SELECT
+                            m.received_at AS ts,
+                            ROUND(p.lat::numeric, 5)::float AS lat,
+                            ROUND(p.lon::numeric, 5)::float AS lon,
+                            ROUND(p.speed::numeric, 1)::float AS speed,
+                            ROUND(p.course::numeric, 1)::float AS heading
+                        FROM ais_position p
+                        JOIN ais_message m ON m.id = p.msg_id
+                        WHERE m.mmsi = %s
+                          AND p.lat IS NOT NULL AND p.lon IS NOT NULL
+                          AND p.lat BETWEEN -85 AND 85 AND p.lon BETWEEN -180 AND 180
+                          AND (p.lat != 0 OR p.lon != 0)
+                    ),
+                    bucketed AS (
+                        SELECT DISTINCT ON (date_trunc('minute', ts))
+                            ts, lat, lon, speed, heading
+                        FROM raw_pts
+                        ORDER BY date_trunc('minute', ts) ASC, ts ASC
+                    )
+                    SELECT ts, lat, lon, speed, heading
+                    FROM bucketed
+                    ORDER BY ts ASC
+                    LIMIT 900
+                    """,
+                    (mmsi_int, mmsi_int),
+                )
+                for r in cur.fetchall():
+                    points.append(
+                        {
+                            "lat": r["lat"],
+                            "lon": r["lon"],
+                            "speed": r["speed"],
+                            "heading": r["heading"],
+                            "ts_utc": r["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if r.get("ts") else "—",
+                        }
+                    )
+        conn.close()
+    except Exception as e:
+        print(f"[sdr-launcher] Track query error ({domain}:{target_id}): {e}", flush=True)
+
+    return {
+        "domain": domain,
+        "target_id": target_id,
+        "count": len(points),
+        "points": points,
+    }
+
+
+def get_notable_tracks(max_targets: int = 12) -> dict:
+    """
+    Returns multi-point historical track polylines for the highest-scoring
+    notable aircraft and vessels in spotter_highlights.
+    """
+    tracks = []
+    try:
+        conn = psycopg2.connect(PG_DSN)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT domain, target_id, name_or_reg, category_key, badge, score
+                FROM spotter_highlights
+                WHERE lat IS NOT NULL AND lon IS NOT NULL
+                ORDER BY score DESC, last_seen DESC
+                LIMIT %s
+                """,
+                (max_targets * 2,),
+            )
+            candidates = cur.fetchall()
+        conn.close()
+
+        for c in candidates:
+            tr = get_target_track(c["domain"], c["target_id"], hours=48)
+            if len(tr.get("points", [])) >= 2:
+                tracks.append(
+                    {
+                        "domain": c["domain"],
+                        "target_id": c["target_id"],
+                        "name": c["name_or_reg"],
+                        "category_key": c["category_key"],
+                        "badge": c["badge"],
+                        "points": tr["points"],
+                    }
+                )
+            if len(tracks) >= max_targets:
+                break
+    except Exception as e:
+        print(f"[sdr-launcher] Notable tracks error: {e}", flush=True)
+    return {"tracks": tracks}
+
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1938,8 +2113,10 @@ HTML_PAGE = """<!DOCTYPE html>
             <button class="seg-btn" id="fltPlanes" onclick="setMapFilter('planes')">Aircraft</button>
           </div>
         </div>
-        <div style="display:flex;align-items:center;gap:0.65rem;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap">
           <span class="panel-meta" id="mapCountBanner">Loading targets...</span>
+          <button class="action-chip locate" id="btnNotableTracks" onclick="toggleNotableTracks()">Notable Trails</button>
+          <button class="action-chip" id="btnClearTrack" style="display:none" onclick="clearTracks()">Clear Trail</button>
           <button class="action-chip" onclick="fitMapHighlights()">Fit Notable</button>
         </div>
       </div>
@@ -2045,6 +2222,8 @@ let switching = false;
 
 let map = null;
 let mapLayerGroup = null;
+let trackLayerGroup = null;
+let notableTracksActive = false;
 let markerIndex = {};
 let cachedMapData = {station: {}, aircraft: [], ships: [], highlights_log: []};
 let cachedAdsb = {};
@@ -2060,13 +2239,109 @@ function initMap() {
     attribution: '&copy; OpenStreetMap contributors',
     maxZoom: 18
   }).addTo(map);
+  trackLayerGroup = L.layerGroup().addTo(map);
   mapLayerGroup = L.layerGroup().addTo(map);
+}
+
+function drawPolylineTrack(domain, name, points, fitBounds = false) {
+  if (!trackLayerGroup || !points || points.length < 2) return;
+  const latlngs = points.map(pt => [pt.lat, pt.lon]);
+  const color = domain === 'ship' ? '#f59e0b' : '#38bdf8';
+  // Outer dark casing for high contrast over map tiles
+  L.polyline(latlngs, {
+    color: '#090d16',
+    weight: 4.5,
+    opacity: 0.75
+  }).addTo(trackLayerGroup);
+  // Inner semantic trajectory line
+  const line = L.polyline(latlngs, {
+    color: color,
+    weight: 2.4,
+    opacity: 0.92,
+    dashArray: domain === 'aircraft' ? '6, 4' : null
+  }).addTo(trackLayerGroup);
+  line.bindTooltip(`${name} (${points.length} track pts)`, {sticky: true});
+
+  // Draw historical waypoint dots
+  const step = Math.max(1, Math.floor(points.length / 25));
+  points.forEach((pt, idx) => {
+    if (idx !== 0 && idx !== points.length - 1 && idx % step !== 0) return;
+    const wp = L.circleMarker([pt.lat, pt.lon], {
+      radius: idx === 0 || idx === points.length - 1 ? 3.8 : 2.4,
+      color: '#090d16',
+      weight: 1,
+      fillColor: color,
+      fillOpacity: 0.95
+    });
+    const meta = domain === 'ship'
+      ? `${pt.speed ?? '—'} kt · ${pt.heading ?? '—'}°`
+      : `${pt.alt_baro ?? '—'} ft · ${pt.speed ?? '—'} kt`;
+    wp.bindTooltip(`<b>${name}</b><br>${pt.ts_utc}<br>${meta}`, {direction: 'top'});
+    wp.addTo(trackLayerGroup);
+  });
+
+  document.getElementById('btnClearTrack').style.display = 'inline-flex';
+  if (fitBounds && map && latlngs.length > 1) {
+    map.fitBounds(latlngs, {padding: [45, 45], maxZoom: 12});
+  }
+}
+
+async function showTargetTrack(domain, targetId, label, fitBounds = false) {
+  initMap();
+  notableTracksActive = false;
+  document.getElementById('btnNotableTracks').classList.remove('active');
+  trackLayerGroup.clearLayers();
+  try {
+    const res = await fetch(`/api/track?domain=${encodeURIComponent(domain)}&id=${encodeURIComponent(targetId)}&hours=48`);
+    const data = await res.json();
+    const pts = data.points || [];
+    if (pts.length >= 2) {
+      drawPolylineTrack(domain, label || targetId, pts, fitBounds);
+    }
+  } catch (e) {
+    console.error('Track fetch error:', e);
+  }
+}
+
+async function toggleNotableTracks() {
+  initMap();
+  if (notableTracksActive) {
+    clearTracks();
+    return;
+  }
+  notableTracksActive = true;
+  trackLayerGroup.clearLayers();
+  const btn = document.getElementById('btnNotableTracks');
+  btn.textContent = 'Loading Trails...';
+  try {
+    const res = await fetch('/api/tracks/notable');
+    const data = await res.json();
+    const tracks = data.tracks || [];
+    tracks.forEach(tr => {
+      drawPolylineTrack(tr.domain, tr.name, tr.points, false);
+    });
+    btn.textContent = `Notable Trails (${tracks.length})`;
+    document.getElementById('btnClearTrack').style.display = 'inline-flex';
+  } catch (e) {
+    btn.textContent = 'Notable Trails';
+    notableTracksActive = false;
+  }
+}
+
+function clearTracks() {
+  if (trackLayerGroup) trackLayerGroup.clearLayers();
+  notableTracksActive = false;
+  document.getElementById('btnNotableTracks').textContent = 'Notable Trails';
+  document.getElementById('btnClearTrack').style.display = 'none';
 }
 
 function buildPopupHtml(domain, item) {
   const linksHtml = (item.links || []).map(l =>
     `<a class="action-chip" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`
   ).join(' ');
+  const trackLabel = domain === 'ship' ? (item.shipname || item.mmsi) : (item.callsign !== '—' ? item.callsign : item.hex);
+  const trackId = domain === 'ship' ? item.mmsi : item.hex;
+  const trackBtn = `<button class="action-chip locate" onclick="showTargetTrack('${domain}', '${trackId}', '${String(trackLabel).replace(/'/g, "")}', true)">Draw Track Trail</button>`;
   if (domain === 'ship') {
     return `
       <div style="min-inline-size:230px">
@@ -2078,7 +2353,7 @@ function buildPopupHtml(domain, item) {
           Hull ${item.len_m || '—'}m × ${item.beam_m || '—'}m · Draught ${item.draught || '—'}m<br>
           Speed ${item.speed ?? '—'} kt · Course ${item.course ?? '—'}°
         </div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap">${linksHtml}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">${trackBtn} ${linksHtml}</div>
       </div>
     `;
   } else {
@@ -2092,7 +2367,7 @@ function buildPopupHtml(domain, item) {
           ICAO ${item.hex} · ${item.type_desc}<br>
           Alt ${item.alt_baro ?? '—'} ft · Speed ${item.gs ?? '—'} kt · Track ${item.track ?? '—'}°
         </div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap">${linksHtml}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">${trackBtn} ${linksHtml}</div>
       </div>
     `;
   }
@@ -2149,6 +2424,7 @@ function renderCombinedMap() {
         marker.bindTooltip(`${s.shipname} (${s.len_m || '—'}m)`, {direction: 'top'});
       }
       marker.bindPopup(buildPopupHtml('ship', s));
+      marker.on('click', () => showTargetTrack('ship', s.id, s.shipname, false));
       marker.addTo(mapLayerGroup);
       markerIndex['ship:' + s.id] = marker;
     });
@@ -2196,6 +2472,7 @@ function renderCombinedMap() {
         marker.bindTooltip(`${lbl} (${p.type_code || p.hex})`, {direction: 'top'});
       }
       marker.bindPopup(buildPopupHtml('aircraft', p));
+      marker.on('click', () => showTargetTrack('aircraft', p.id, lbl, false));
       marker.addTo(mapLayerGroup);
       markerIndex['aircraft:' + p.id] = marker;
     });
@@ -2229,6 +2506,7 @@ function locateOnMap(domain, targetId, lat, lon) {
   if (currentMapFilter !== 'all') {
     setMapFilter('all');
   }
+  showTargetTrack(domain, targetId, targetId, false);
   const key = domain + ':' + targetId;
   const m = markerIndex[key];
   if (m && map) {
@@ -2717,6 +2995,14 @@ class LauncherHandler(BaseHTTPRequestHandler):
                 _MAP_CACHE["ts"] = now
                 _MAP_CACHE["data"] = payload
             self._send_json(payload)
+        elif parsed.path == "/api/track":
+            qs = parse_qs(parsed.query)
+            domain = (qs.get("domain", [""])[0]).strip()
+            target_id = (qs.get("id", [""])[0]).strip()
+            hours = int(qs.get("hours", ["48"])[0] or "48")
+            self._send_json(get_target_track(domain, target_id, hours=hours))
+        elif parsed.path == "/api/tracks/notable":
+            self._send_json(get_notable_tracks(max_targets=14))
         elif parsed.path == "/api/highlights/export.csv":
             buf = io.StringIO()
             try:
