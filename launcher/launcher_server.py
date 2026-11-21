@@ -12,6 +12,7 @@ Features:
 """
 
 import csv
+import gzip
 import io
 import json
 import math
@@ -800,9 +801,34 @@ def activate_mode(mode_id: str) -> dict:
     return _switch_hardware_to(mode_id)
 
 
-def get_system_info() -> dict:
-    lsusb_out = run_cmd(["lsusb"]) or run_cmd(["/usr/bin/lsusb"])
-    usb_connected = ("0bda:2838" in lsusb_out) or Path("/dev/bus/usb").exists()
+_HW_NET_CACHE = {"ts": 0.0, "usb_connected": True, "lan_connected": True, "tailscale_connected": True, "tailscale_auth_url": None, "tailscale_status": "Connected"}
+
+
+def get_system_info(fast_cached: bool = False) -> dict:
+    now = time.time()
+    if (now - _HW_NET_CACHE["ts"]) >= 15.0 and not fast_cached:
+        lsusb_out = run_cmd(["lsusb"]) or run_cmd(["/usr/bin/lsusb"])
+        usb_connected = ("0bda:2838" in lsusb_out) or Path("/dev/bus/usb").exists()
+        lan_ip = run_cmd(["hostname", "-I"]).split()
+        primary_lan = next((ip for ip in lan_ip if not ip.startswith("100.") and ":" not in ip), None)
+        tailscale_ip = run_cmd(["tailscale", "ip", "-4"])
+        tailscale_auth_url = None
+        if not tailscale_ip:
+            try:
+                ts_json = json.loads(run_cmd(["tailscale", "status", "--json"]) or "{}")
+                tailscale_auth_url = ts_json.get("AuthURL") or None
+            except Exception:
+                pass
+        _HW_NET_CACHE.update(
+            {
+                "ts": now,
+                "usb_connected": usb_connected,
+                "lan_connected": bool(primary_lan),
+                "tailscale_connected": bool(tailscale_ip),
+                "tailscale_auth_url": tailscale_auth_url,
+                "tailscale_status": "Connected" if tailscale_ip else "Not Connected",
+            }
+        )
 
     temp_c = None
     try:
@@ -816,38 +842,30 @@ def get_system_info() -> dict:
     disk_used_pct = round((disk.used / disk.total) * 100, 1)
     disk_free_gb = round(disk.free / (1024**3), 1)
 
-    lan_ip = run_cmd(["hostname", "-I"]).split()
-    primary_lan = next((ip for ip in lan_ip if not ip.startswith("100.") and ":" not in ip), None)
-    tailscale_ip = run_cmd(["tailscale", "ip", "-4"])
-    tailscale_auth_url = None
-    if not tailscale_ip:
-        try:
-            ts_json = json.loads(run_cmd(["tailscale", "status", "--json"]) or "{}")
-            tailscale_auth_url = ts_json.get("AuthURL") or None
-        except Exception:
-            pass
-    tailscale_status = "Connected" if tailscale_ip else "Not Connected"
-
+    # Batch all systemd service checks into ONE subprocess invocation (~12ms vs ~700ms)
+    mode_items = list(EXCLUSIVE_MODES.items())
+    svc_names = [m["service"] for _, m in mode_items]
+    states = run_cmd(["systemctl", "is-active"] + svc_names).splitlines()
     active_mode = "off"
     modes_status = {}
-    for mid, m in EXCLUSIVE_MODES.items():
-        act = get_service_active(m["service"])
+    for idx, (mid, _) in enumerate(mode_items):
+        act = (states[idx].strip() == "active") if idx < len(states) else False
         modes_status[mid] = act
         if act:
             active_mode = mid
 
     return {
         "station_name": STATION_NAME,
-        "usb_sdr": "Nooelec NESDR SMArt v5" if usb_connected else "Not detected",
-        "usb_connected": usb_connected,
+        "usb_sdr": "Nooelec NESDR SMArt v5" if _HW_NET_CACHE["usb_connected"] else "Not detected",
+        "usb_connected": _HW_NET_CACHE["usb_connected"],
         "cpu_temp_c": temp_c,
         "load_1m": round(load_avg[0], 2),
         "disk_used_pct": disk_used_pct,
         "disk_free_gb": disk_free_gb,
-        "lan_connected": bool(primary_lan),
-        "tailscale_connected": bool(tailscale_ip),
-        "tailscale_auth_url": tailscale_auth_url,
-        "tailscale_status": tailscale_status,
+        "lan_connected": _HW_NET_CACHE["lan_connected"],
+        "tailscale_connected": _HW_NET_CACHE["tailscale_connected"],
+        "tailscale_auth_url": _HW_NET_CACHE["tailscale_auth_url"],
+        "tailscale_status": _HW_NET_CACHE["tailscale_status"],
         "active_mode": active_mode,
         "modes_status": modes_status,
         "cycler": CYCLER.status(),
@@ -1082,7 +1100,11 @@ def get_ais_summary() -> dict:
                        ROUND(lon::numeric, 5)::float AS lon,
                        count, received_at
                 FROM ais_state
-                ORDER BY CASE WHEN shipname IS NOT NULL AND TRIM(shipname) != '' THEN 0 ELSE 1 END, received_at DESC NULLS LAST
+                ORDER BY
+                    CASE WHEN shipname IS NOT NULL AND TRIM(shipname) != '' THEN 0 ELSE 1 END,
+                    (COALESCE(to_bow, 0) + COALESCE(to_stern, 0)) DESC,
+                    received_at DESC NULLS LAST
+                LIMIT 450
                 """
             )
             rows = cur.fetchall()
@@ -1557,11 +1579,17 @@ def get_target_track(domain: str, target_id: str, hours: int = 24) -> dict:
     }
 
 
+_NOTABLE_TRACKS_CACHE = {"ts": 0.0, "data": None}
+
+
 def get_notable_tracks(max_targets: int = 12) -> dict:
     """
     Returns multi-point historical track polylines for the highest-scoring
-    notable aircraft and vessels in spotter_highlights.
+    notable aircraft and vessels in spotter_highlights (cached for 60s).
     """
+    now = time.time()
+    if _NOTABLE_TRACKS_CACHE["data"] and (now - _NOTABLE_TRACKS_CACHE["ts"]) < 60.0:
+        return _NOTABLE_TRACKS_CACHE["data"]
     tracks = []
     try:
         conn = psycopg2.connect(PG_DSN)
@@ -1596,7 +1624,10 @@ def get_notable_tracks(max_targets: int = 12) -> dict:
                 break
     except Exception as e:
         print(f"[sdr-launcher] Notable tracks error: {e}", flush=True)
-    return {"tracks": tracks}
+    res = {"tracks": tracks}
+    _NOTABLE_TRACKS_CACHE["ts"] = time.time()
+    _NOTABLE_TRACKS_CACHE["data"] = res
+    return res
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -2471,7 +2502,7 @@ let currentTableTab = 'logbook';
 
 function initMap() {
   if (map) return;
-  map = L.map('combinedMap').setView([1.22, 103.80], 10);
+  map = L.map('combinedMap', {preferCanvas: true}).setView([1.22, 103.80], 10);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap contributors',
     maxZoom: 18
@@ -3152,7 +3183,10 @@ async function fetchMapAndLog() {
   try {
     const res = await fetch('/api/map');
     cachedMapData = await res.json();
-    renderCombinedMap();
+    // Skip wiping markers if user currently has an active popup open on the map
+    if (!(map && map._popup && map.hasLayer(map._popup))) {
+      renderCombinedMap();
+    }
     if (currentTableTab === 'logbook') {
       renderActiveTable();
     }
@@ -3358,12 +3392,63 @@ setInterval(fetchMapAndLog, 12000);
 """
 
 
+def _background_cache_warmer():
+    """
+    Continuously refreshes _STATUS_CACHE and _MAP_CACHE in the background so
+    HTTP GET /api/status and GET /api/map return from RAM in < 3 ms without
+    blocking the browser on PostgreSQL queries or subprocess calls.
+    """
+    last_map_ts = 0.0
+    last_sts_ts = 0.0
+    while True:
+        now = time.time()
+        try:
+            status_payload = {
+                "system": get_system_info(),
+                "modes": EXCLUSIVE_MODES,
+                "adsb": compute_adsb_analytics(),
+                "ais": get_ais_summary(),
+            }
+            _STATUS_CACHE["ts"] = time.time()
+            _STATUS_CACHE["data"] = status_payload
+        except Exception as e:
+            print(f"[cache-warmer] status error: {e}", flush=True)
+
+        if (now - last_map_ts) >= 9.0 or _MAP_CACHE["data"] is None:
+            try:
+                _MAP_CACHE["data"] = get_combined_map_and_log()
+                _MAP_CACHE["ts"] = time.time()
+                last_map_ts = time.time()
+            except Exception as e:
+                print(f"[cache-warmer] map error: {e}", flush=True)
+
+        if (now - last_sts_ts) >= 600.0:
+            try:
+                run_sts_detection(force=False)
+                last_sts_ts = time.time()
+            except Exception:
+                pass
+
+        time.sleep(3.5)
+
+
 class LauncherHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
     def _send_json(self, payload: dict, status=HTTPStatus.OK):
         raw = json.dumps(payload).encode("utf-8")
+        accept_enc = self.headers.get("Accept-Encoding", "")
+        if "gzip" in accept_enc and len(raw) > 1024:
+            raw = gzip.compress(raw, compresslevel=5)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -3385,27 +3470,29 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "https://github.com/smichpresel/sdr-station/blob/main/doc/README.md")
             self.end_headers()
         elif parsed.path == "/api/status":
-            now = time.time()
-            if _STATUS_CACHE["data"] and (now - _STATUS_CACHE["ts"]) < 3.0:
-                payload = _STATUS_CACHE["data"]
-                payload["system"] = get_system_info()
+            if _STATUS_CACHE["data"] is not None:
+                payload = dict(_STATUS_CACHE["data"])
+                # Refresh lightweight in-memory cycler & tunnel countdowns in < 0.2ms
+                sys_copy = dict(payload.get("system", {}))
+                sys_copy["cycler"] = CYCLER.status()
+                sys_copy["tunnel"] = TUNNEL.status()
+                payload["system"] = sys_copy
             else:
                 payload = {
-                    "system": get_system_info(),
+                    "system": get_system_info(fast_cached=True),
                     "modes": EXCLUSIVE_MODES,
                     "adsb": compute_adsb_analytics(),
                     "ais": get_ais_summary(),
                 }
-                _STATUS_CACHE["ts"] = now
+                _STATUS_CACHE["ts"] = time.time()
                 _STATUS_CACHE["data"] = payload
             self._send_json(payload)
         elif parsed.path == "/api/map":
-            now = time.time()
-            if _MAP_CACHE["data"] and (now - _MAP_CACHE["ts"]) < 6.0:
+            if _MAP_CACHE["data"] is not None:
                 payload = _MAP_CACHE["data"]
             else:
                 payload = get_combined_map_and_log()
-                _MAP_CACHE["ts"] = now
+                _MAP_CACHE["ts"] = time.time()
                 _MAP_CACHE["data"] = payload
             self._send_json(payload)
         elif parsed.path == "/api/track":
@@ -3419,7 +3506,10 @@ class LauncherHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/sts":
             qs = parse_qs(parsed.query)
             force = qs.get("force", ["0"])[0] in ("1", "true")
-            events = run_sts_detection(force=force)
+            if force:
+                events = run_sts_detection(force=True)
+            else:
+                events = get_sts_events()
             self._send_json({"count": len(events), "events": events})
         elif parsed.path == "/api/sanctions/status":
             self._send_json(get_watchlist_cache()["stats"])
@@ -3506,6 +3596,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/mode":
             mode_id = body.get("mode", "")
             result = activate_mode(mode_id)
+            if _STATUS_CACHE["data"]:
+                _STATUS_CACHE["data"]["system"] = get_system_info(fast_cached=True)
             self._send_json(result)
         elif parsed.path == "/api/cycler":
             en = bool(body.get("enabled", True))
@@ -3519,6 +3611,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
                 patrol_every_n=body.get("patrol_every_n"),
                 wx_south_preempt=body.get("wx_south_preempt"),
             )
+            if _STATUS_CACHE["data"]:
+                _STATUS_CACHE["data"]["system"] = get_system_info(fast_cached=True)
             self._send_json({"ok": True, "cycler": result})
         elif parsed.path == "/api/tunnel":
             en = bool(body.get("enabled", False))
@@ -3538,6 +3632,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    warmer = threading.Thread(target=_background_cache_warmer, daemon=True)
+    warmer.start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), LauncherHandler)
     print(f"[sdr-launcher] Listening on 0.0.0.0:{PORT}", flush=True)
     srv.serve_forever()

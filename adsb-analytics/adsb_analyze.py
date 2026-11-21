@@ -348,6 +348,7 @@ def compute_analytics(dsn: str = PG_DSN) -> dict:
                 samples, last_seen
             FROM adsb_flights
             ORDER BY last_seen DESC
+            LIMIT 300
             """
         )
         all_flights_raw = cur.fetchall()
