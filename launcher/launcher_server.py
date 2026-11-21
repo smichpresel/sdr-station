@@ -543,12 +543,47 @@ def _switch_hardware_to(mode_id: str) -> dict:
     return {"ok": True, "active_mode": mode_id, "is_active": get_service_active(target_svc)}
 
 
+RF_PROTOCOLS_STATE_FILE = Path(os.environ.get("RF_PROTOCOLS_STATE_FILE", str(BASE_DIR / "data" / "rf_protocols_state.json")))
+PATROL_PROTOCOLS = [
+    {"protocol": "acars", "freq": "131.550M,131.725M,131.450M,131.825M", "gain": "42.1", "squelch": 24},
+    {"protocol": "dsc", "freq": "156.525M", "gain": "40.2", "squelch": 18},
+    {"protocol": "aprs", "freq": "144.800M", "gain": "40.2", "squelch": 16},
+]
+
+
+def _set_rf_protocol_profile(cfg: dict):
+    try:
+        RF_PROTOCOLS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RF_PROTOCOLS_STATE_FILE.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
+
+
 class DualBandCycler:
+    """
+    Asymmetric Multi-Band Scheduler with South-Sky Weather Satellite Pass Preemption:
+      - Core loop: `adsb_sec` (default 40s) on 1090 MHz ADS-B + `ais_sec` (default 80s) on 162 MHz Marine AIS
+      - Periodic RF Datalink Patrol: every `patrol_every_n` (default 5) frames, inserts a `patrol_sec` (default 45s)
+        slot on `rfprotocols` rotating through ACARS (131.55 MHz), VHF Ch 70 DSC (156.525 MHz), and APRS (144.80 MHz)
+      - South-Sky WX Satellite Preemption: when `wx_south_preempt` is enabled and a NOAA/Meteor polar satellite
+        enters the open southern sky sector (Azimuth 105-255 deg, Elevation >= 28 deg), preempts the tuner to
+        137 MHz `wx_sat` reception for the southern half of the pass.
+    """
+
     def __init__(self):
         self.lock = threading.Lock()
         self.enabled = True
-        self.interval_sec = 120
+        self.adsb_sec = 40
+        self.ais_sec = 80
+        self.patrol_enabled = True
+        self.patrol_sec = 45
+        self.patrol_every_n = 5
+        self.wx_south_preempt = True
+        self.open_sky_sector = "S"
         self.current_target = "adsb"
+        self.active_slot_duration = 40
+        self.active_wx_sat = None
+        self.patrol_idx = 0
         self.last_switch_ts = time.time()
         self.cycles_completed = 0
         self._load_state()
@@ -560,10 +595,26 @@ class DualBandCycler:
             try:
                 data = json.loads(CYCLER_STATE_FILE.read_text())
                 self.enabled = bool(data.get("enabled", True))
-                self.interval_sec = int(data.get("interval_sec", 120))
+                self.adsb_sec = max(20, int(data.get("adsb_sec", 40)))
+                self.ais_sec = max(20, int(data.get("ais_sec", 80)))
+                self.patrol_enabled = bool(data.get("patrol_enabled", True))
+                self.patrol_sec = max(0, int(data.get("patrol_sec", 45)))
+                self.patrol_every_n = max(2, int(data.get("patrol_every_n", 5)))
+                self.wx_south_preempt = bool(data.get("wx_south_preempt", True))
+                self.open_sky_sector = str(data.get("open_sky_sector", "S"))
                 self.current_target = data.get("current_target", "adsb")
             except Exception:
                 pass
+        self.active_slot_duration = self._dwell_for(self.current_target)
+
+    def _dwell_for(self, target: str) -> int:
+        if target == "adsb":
+            return self.adsb_sec
+        if target == "ais":
+            return self.ais_sec
+        if target == "rfprotocols":
+            return max(25, self.patrol_sec)
+        return self.adsb_sec
 
     def _save_state(self):
         try:
@@ -572,7 +623,13 @@ class DualBandCycler:
                 json.dumps(
                     {
                         "enabled": self.enabled,
-                        "interval_sec": self.interval_sec,
+                        "adsb_sec": self.adsb_sec,
+                        "ais_sec": self.ais_sec,
+                        "patrol_enabled": self.patrol_enabled,
+                        "patrol_sec": self.patrol_sec,
+                        "patrol_every_n": self.patrol_every_n,
+                        "wx_south_preempt": self.wx_south_preempt,
+                        "open_sky_sector": self.open_sky_sector,
                         "current_target": self.current_target,
                     },
                     indent=2,
@@ -581,11 +638,27 @@ class DualBandCycler:
         except Exception:
             pass
 
-    def configure(self, enabled: bool, interval_sec: int = None) -> dict:
+    def configure(self, enabled: bool = True, **kwargs) -> dict:
         with self.lock:
-            if interval_sec is not None and int(interval_sec) >= 30:
-                self.interval_sec = int(interval_sec)
             self.enabled = bool(enabled)
+            if "interval_sec" in kwargs and kwargs["interval_sec"] is not None and "adsb_sec" not in kwargs:
+                total = max(60, int(kwargs["interval_sec"]))
+                self.adsb_sec = max(25, int(round(total * 0.33)))
+                self.ais_sec = max(35, total - self.adsb_sec)
+            if kwargs.get("adsb_sec") is not None:
+                self.adsb_sec = max(20, min(600, int(kwargs["adsb_sec"])))
+            if kwargs.get("ais_sec") is not None:
+                self.ais_sec = max(20, min(600, int(kwargs["ais_sec"])))
+            if kwargs.get("patrol_sec") is not None:
+                self.patrol_sec = max(0, min(300, int(kwargs["patrol_sec"])))
+                self.patrol_enabled = self.patrol_sec >= 20
+            if kwargs.get("patrol_enabled") is not None:
+                self.patrol_enabled = bool(kwargs["patrol_enabled"])
+            if kwargs.get("patrol_every_n") is not None:
+                self.patrol_every_n = max(2, min(20, int(kwargs["patrol_every_n"])))
+            if kwargs.get("wx_south_preempt") is not None:
+                self.wx_south_preempt = bool(kwargs["wx_south_preempt"])
+            self.active_slot_duration = self._dwell_for(self.current_target)
             self.last_switch_ts = time.time()
             self._save_state()
             target = self.current_target if self.enabled else None
@@ -598,21 +671,59 @@ class DualBandCycler:
         with self.lock:
             if self.enabled:
                 self.enabled = False
+                self.active_wx_sat = None
                 self._save_state()
 
+    def _compute_next_target_locked(self) -> str:
+        if self.current_target == "adsb":
+            if (
+                self.patrol_enabled
+                and self.patrol_sec >= 20
+                and self.cycles_completed > 0
+                and (self.cycles_completed % self.patrol_every_n == 0)
+            ):
+                return "rfprotocols"
+            return "ais"
+        if self.current_target == "rfprotocols":
+            return "ais"
+        return "adsb"
+
     def status(self) -> dict:
+        passes = compute_upcoming_wx_passes(self.open_sky_sector)
+        next_south = next((p for p in passes if p.get("south_favorable")), passes[0] if passes else None)
         with self.lock:
             elapsed = time.time() - self.last_switch_ts
-            remaining = max(0, int(self.interval_sec - elapsed)) if self.enabled else None
-            next_mode = "ais" if self.current_target == "adsb" else "adsb"
+            remaining = max(0, int(self.active_slot_duration - elapsed)) if self.enabled else None
+            next_mode = self._compute_next_target_locked()
             return {
                 "enabled": self.enabled,
-                "interval_sec": self.interval_sec,
+                "adsb_sec": self.adsb_sec,
+                "ais_sec": self.ais_sec,
+                "patrol_enabled": self.patrol_enabled,
+                "patrol_sec": self.patrol_sec,
+                "patrol_every_n": self.patrol_every_n,
+                "wx_south_preempt": self.wx_south_preempt,
+                "open_sky_sector": self.open_sky_sector,
+                "active_wx_sat": self.active_wx_sat,
+                "next_south_wx_pass": next_south,
                 "current_target": self.current_target,
                 "next_target": next_mode,
+                "active_slot_duration": self.active_slot_duration,
                 "seconds_remaining": remaining,
                 "cycles_completed": self.cycles_completed,
             }
+
+    def _check_south_wx_preempt(self) -> dict | None:
+        if not self.wx_south_preempt:
+            return None
+        try:
+            passes = compute_upcoming_wx_passes(self.open_sky_sector)
+            for p in passes:
+                if p.get("in_south_sector_now") and p.get("south_favorable"):
+                    return p
+        except Exception:
+            pass
+        return None
 
     def _run_loop(self):
         time.sleep(1.5)
@@ -625,17 +736,55 @@ class DualBandCycler:
         while True:
             time.sleep(1.0)
             do_switch = None
+            wx_preempt_pass = self._check_south_wx_preempt()
+
             with self.lock:
                 if not self.enabled:
                     continue
-                if time.time() - self.last_switch_ts >= self.interval_sec:
-                    self.current_target = "ais" if self.current_target == "adsb" else "adsb"
-                    self.last_switch_ts = time.time()
-                    self.cycles_completed += 1
-                    self._save_state()
-                    do_switch = self.current_target
+
+                # 1. Event-driven South-Sky Weather Satellite Pass Preemption
+                if wx_preempt_pass:
+                    sat_label = f"{wx_preempt_pass['satellite']} ({wx_preempt_pass['freq']} · {wx_preempt_pass['max_elevation_deg']}° S-Sky)"
+                    if self.active_wx_sat != sat_label or self.current_target != "rfprotocols":
+                        self.active_wx_sat = sat_label
+                        self.current_target = "rfprotocols"
+                        self.active_slot_duration = int(wx_preempt_pass.get("south_window_dur_min", 6)) * 60
+                        self.last_switch_ts = time.time()
+                        _set_rf_protocol_profile(
+                            {
+                                "protocol": "wx_sat",
+                                "freq": wx_preempt_pass["freq"],
+                                "gain": "44.5",
+                                "squelch": 0,
+                            }
+                        )
+                        do_switch = "rfprotocols"
+                else:
+                    if self.active_wx_sat is not None:
+                        # South-sky pass finished; resume ADS-B immediately
+                        self.active_wx_sat = None
+                        self.current_target = "adsb"
+                        self.active_slot_duration = self.adsb_sec
+                        self.last_switch_ts = time.time()
+                        do_switch = "adsb"
+                    elif time.time() - self.last_switch_ts >= self.active_slot_duration:
+                        next_t = self._compute_next_target_locked()
+                        if next_t == "rfprotocols":
+                            prof = PATROL_PROTOCOLS[self.patrol_idx % len(PATROL_PROTOCOLS)]
+                            self.patrol_idx += 1
+                            _set_rf_protocol_profile(prof)
+                        self.current_target = next_t
+                        self.active_slot_duration = self._dwell_for(next_t)
+                        self.last_switch_ts = time.time()
+                        self.cycles_completed += 1
+                        self._save_state()
+                        do_switch = self.current_target
+
             if do_switch:
-                print(f"[cycler] Switching SDR hardware to {do_switch.upper()} ({self.interval_sec}s cycle)", flush=True)
+                print(
+                    f"[cycler] Switching SDR hardware to {do_switch.upper()} ({self.active_slot_duration}s slot)",
+                    flush=True,
+                )
                 _switch_hardware_to(do_switch)
 
 
@@ -2116,22 +2265,40 @@ HTML_PAGE = """<!DOCTYPE html>
       <div style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem;flex-wrap:wrap">
         <div style="display:flex;align-items:center;gap:0.5rem">
           <span class="dot live" id="cyclerDot"></span>
-          <strong style="font-size:0.84rem;color:var(--ink-strong)" id="cyclerHeadline">Dual-Band Auto-Cycler (1090 MHz ADS-B / 162 MHz AIS)</strong>
+          <strong style="font-size:0.84rem;color:var(--ink-strong)" id="cyclerHeadline">Asymmetric Auto-Cycler (40s ADS-B / 80s AIS + Patrol + South-Sky WX)</strong>
         </div>
         <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap">
-          <select class="ctrl-select num" id="cycleIntervalSelect" onchange="changeCycleInterval()" aria-label="Cycle interval">
-            <option value="60">1m window</option>
-            <option value="120" selected>2m window</option>
-            <option value="180">3m window</option>
-            <option value="300">5m window</option>
-            <option value="600">10m window</option>
-          </select>
           <button class="btn" id="cyclerToggleBtn" onclick="toggleCycler()">Pause Cycler</button>
           <button class="btn btn-subtle" onclick="switchMode('off')">Standby</button>
         </div>
       </div>
-      <p style="font-size:0.76rem;color:var(--ink-muted)" id="cyclerSub">
-        Alternating single RTL-SDR tuner between Mode-S aircraft reception and VHF maritime AIS reception.
+
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.5rem;font-size:0.74rem;color:var(--ink-muted)">
+        <label style="display:inline-flex;align-items:center;gap:0.3rem">
+          ADS-B(s)
+          <input class="ctrl-select num" id="inAdsbSec" type="number" min="20" max="600" value="40" style="inline-size:4.2rem">
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:0.3rem">
+          AIS(s)
+          <input class="ctrl-select num" id="inAisSec" type="number" min="20" max="600" value="80" style="inline-size:4.2rem">
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:0.3rem" title="Sample ACARS / DSC / APRS every Nth cycle (0 = disabled)">
+          Patrol(s)
+          <input class="ctrl-select num" id="inPatrolSec" type="number" min="0" max="300" value="45" style="inline-size:4.2rem">
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:0.3rem">
+          Every
+          <input class="ctrl-select num" id="inPatrolEvery" type="number" min="2" max="20" value="5" style="inline-size:3.5rem">
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:0.35rem;cursor:pointer;color:var(--ink)" title="Automatically preempt tuner for 137 MHz NOAA/Meteor passes entering the southern open sky (Az 105°-255°)">
+          <input id="inWxSouthPreempt" type="checkbox" checked>
+          South-Sky WX Sat Preempt
+        </label>
+        <button class="action-chip locate" onclick="applyCyclerSchedule()">Apply Schedule</button>
+      </div>
+
+      <p style="font-size:0.75rem;color:var(--ink-muted)" id="cyclerSub">
+        Alternating single RTL-SDR tuner on asymmetric dwell schedule with South-Sky weather satellite preemption.
       </p>
     </div>
 
@@ -2772,11 +2939,11 @@ function renderActiveTable() {
       `${pkts.length} decoded frames · ${passes.length} upcoming 137 MHz passes`;
     const passRows = passes.map(w => `
       <tr>
-        <td><span class="tag-spec">WX SAT PASS</span></td>
+        <td><span class="tag-spec">${w.south_favorable ? 'S-SKY FAVORABLE' : 'WX SAT PASS'}</span></td>
         <td class="num" style="color:var(--accent)">${w.freq}</td>
         <td class="num" style="font-weight:600;color:var(--ink-strong)">${w.satellite} (NORAD ${w.norad})</td>
-        <td><span class="tag-spec">${w.mode}</span></td>
-        <td>Upcoming pass in <strong class="num">${w.in_minutes}m</strong> · Max Elevation <strong class="num">${w.max_elevation_deg}°</strong> (${w.duration_min}m window)</td>
+        <td><span class="tag-spec">${w.trajectory || w.mode}</span></td>
+        <td>In <strong class="num">${w.in_minutes}m</strong> · Max El <strong class="num">${w.max_elevation_deg}°</strong> · South Window: <span class="num" style="color:var(--ink-strong)">${w.south_window_utc || w.aos_utc}</span></td>
         <td class="num" style="font-size:0.73rem;color:var(--ink-muted)">${w.aos_utc}</td>
       </tr>
     `).join('');
@@ -2999,44 +3166,69 @@ function renderCycler(cyc, activeMode) {
   const head = document.getElementById('cyclerHeadline');
   const sub = document.getElementById('cyclerSub');
   const btn = document.getElementById('cyclerToggleBtn');
-  const sel = document.getElementById('cycleIntervalSelect');
 
-  if ([60, 120, 180, 300, 600].includes(cyc.interval_sec)) {
-    sel.value = String(cyc.interval_sec);
+  if (document.activeElement.tagName !== 'INPUT') {
+    if (cyc.adsb_sec) document.getElementById('inAdsbSec').value = cyc.adsb_sec;
+    if (cyc.ais_sec) document.getElementById('inAisSec').value = cyc.ais_sec;
+    if (cyc.patrol_sec !== undefined) document.getElementById('inPatrolSec').value = cyc.patrol_sec;
+    if (cyc.patrol_every_n) document.getElementById('inPatrolEvery').value = cyc.patrol_every_n;
+    if (cyc.wx_south_preempt !== undefined) document.getElementById('inWxSouthPreempt').checked = !!cyc.wx_south_preempt;
   }
 
-  const mins = Math.round((cyc.interval_sec || 120) / 60);
+  const adsbS = cyc.adsb_sec || 40;
+  const aisS = cyc.ais_sec || 80;
+  const patS = cyc.patrol_enabled ? ` · Patrol ${cyc.patrol_sec}s/${cyc.patrol_every_n}th` : '';
+  const wxInfo = cyc.next_south_wx_pass
+    ? ` · Next South-Sky WX: <strong class="num" style="color:var(--accent)">${cyc.next_south_wx_pass.satellite} (${cyc.next_south_wx_pass.freq})</strong> in <span class="num">${cyc.next_south_wx_pass.in_minutes}m</span> (${cyc.next_south_wx_pass.max_elevation_deg}° el)`
+    : '';
+
   if (cyc.enabled) {
     dot.className = 'dot live';
-    head.textContent = `Dual-Band Auto-Cycler (${mins}m window · Active)`;
-    sub.innerHTML = `Active receiver: <strong class="num" style="color:var(--ink-strong)">${(activeMode || cyc.current_target).toUpperCase()}</strong> · Next switch to <strong class="num" style="color:var(--ink-strong)">${(cyc.next_target || '').toUpperCase()}</strong> in <span class="num">${cyc.seconds_remaining ?? '--'}s</span> (${cyc.cycles_completed || 0} cycles completed)`;
+    if (cyc.active_wx_sat) {
+      head.textContent = `South-Sky WX Satellite Pass Active: ${cyc.active_wx_sat}`;
+    } else {
+      head.textContent = `Asymmetric Auto-Cycler (${adsbS}s ADS-B / ${aisS}s AIS${patS})`;
+    }
+    sub.innerHTML = `Active slot: <strong class="num" style="color:var(--ink-strong)">${(activeMode || cyc.current_target).toUpperCase()}</strong> (${cyc.active_slot_duration || '--'}s) · Next: <strong class="num" style="color:var(--ink-strong)">${(cyc.next_target || '').toUpperCase()}</strong> in <span class="num">${cyc.seconds_remaining ?? '--'}s</span> (${cyc.cycles_completed || 0} slots)${wxInfo}`;
     btn.textContent = 'Pause Cycler';
     btn.className = 'btn';
   } else {
     dot.className = 'dot amber';
-    head.textContent = `Dual-Band Auto-Cycler (Paused · Locked to ${activeMode.toUpperCase()})`;
-    sub.textContent = `Tuner dedicated to single receiver. Enable cycler to alternate 1090 MHz ADS-B and 162 MHz AIS every ${mins} minutes.`;
+    head.textContent = `Auto-Cycler Paused (Locked to ${(activeMode || 'OFF').toUpperCase()})`;
+    sub.innerHTML = `Tuner dedicated to single receiver. Resume cycler for ${adsbS}s ADS-B / ${aisS}s AIS asymmetric schedule${wxInfo}.`;
     btn.textContent = 'Resume Auto-Cycler';
     btn.className = 'btn btn-primary';
   }
 }
 
 async function toggleCycler() {
-  const interval = parseInt(document.getElementById('cycleIntervalSelect').value || '120', 10);
   await fetch('/api/cycler', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enabled: !cyclerState.enabled, interval_sec: interval})
+    body: JSON.stringify({
+      enabled: !cyclerState.enabled,
+      adsb_sec: parseInt(document.getElementById('inAdsbSec').value || '40', 10),
+      ais_sec: parseInt(document.getElementById('inAisSec').value || '80', 10),
+      patrol_sec: parseInt(document.getElementById('inPatrolSec').value || '45', 10),
+      patrol_every_n: parseInt(document.getElementById('inPatrolEvery').value || '5', 10),
+      wx_south_preempt: document.getElementById('inWxSouthPreempt').checked
+    })
   });
   await fetchStatus();
 }
 
-async function changeCycleInterval() {
-  const interval = parseInt(document.getElementById('cycleIntervalSelect').value || '120', 10);
+async function applyCyclerSchedule() {
   await fetch('/api/cycler', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enabled: true, interval_sec: interval})
+    body: JSON.stringify({
+      enabled: true,
+      adsb_sec: parseInt(document.getElementById('inAdsbSec').value || '40', 10),
+      ais_sec: parseInt(document.getElementById('inAisSec').value || '80', 10),
+      patrol_sec: parseInt(document.getElementById('inPatrolSec').value || '45', 10),
+      patrol_every_n: parseInt(document.getElementById('inPatrolEvery').value || '5', 10),
+      wx_south_preempt: document.getElementById('inWxSouthPreempt').checked
+    })
   });
   await fetchStatus();
 }
@@ -3317,8 +3509,16 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self._send_json(result)
         elif parsed.path == "/api/cycler":
             en = bool(body.get("enabled", True))
-            interval = body.get("interval_sec")
-            result = CYCLER.configure(enabled=en, interval_sec=interval)
+            result = CYCLER.configure(
+                enabled=en,
+                interval_sec=body.get("interval_sec"),
+                adsb_sec=body.get("adsb_sec"),
+                ais_sec=body.get("ais_sec"),
+                patrol_sec=body.get("patrol_sec"),
+                patrol_enabled=body.get("patrol_enabled"),
+                patrol_every_n=body.get("patrol_every_n"),
+                wx_south_preempt=body.get("wx_south_preempt"),
+            )
             self._send_json({"ok": True, "cycler": result})
         elif parsed.path == "/api/tunnel":
             en = bool(body.get("enabled", False))

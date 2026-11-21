@@ -219,24 +219,63 @@ def get_protocol_counts() -> dict:
     return counts
 
 
-def compute_upcoming_wx_passes() -> list[dict]:
+def compute_upcoming_wx_passes(open_sky_sector: str = "S") -> list[dict]:
     """
-    Computes upcoming sun-synchronous polar passes for NOAA 15/18/19 and Meteor-M2
-    based on orbital period and mean node progression.
+    Computes upcoming sun-synchronous polar passes for NOAA 15/18/19 and Meteor-M2,
+    including topocentric Azimuth sector (N->S descending vs S->N ascending) and
+    South-Sky open-horizon window timing (Azimuth 105 deg - 255 deg, SE -> S -> SW).
     """
     now = datetime.now(timezone.utc)
     epoch_sec = now.timestamp()
     passes = []
     for idx, sat in enumerate(WX_SATELLITES):
         period_s = sat["period_min"] * 60.0
-        # Sun-synchronous satellites make ~2 high-elevation passes per 12h over a given latitude
-        cycle_s = period_s * 7.0
-        phase_offset = (sat["norad"] % 3600) + idx * 4100
-        rem = (cycle_s - ((epoch_sec + phase_offset) % cycle_s))
-        aos = now + timedelta(seconds=rem)
+        cycle_s = period_s * 6.5
+        phase_offset = (sat["norad"] % 3600) + idx * 3700
+        elapsed_in_cycle = (epoch_sec + phase_offset) % cycle_s
         duration_min = 11 + (sat["norad"] % 3)
+        duration_s = duration_min * 60.0
+
+        # Check if a pass is currently active or upcoming
+        if elapsed_in_cycle <= duration_s:
+            rem_s = 0.0
+            aos = now - timedelta(seconds=elapsed_in_cycle)
+            is_active_now = True
+            pass_progress = elapsed_in_cycle / duration_s
+        else:
+            rem_s = cycle_s - elapsed_in_cycle
+            aos = now + timedelta(seconds=rem_s)
+            is_active_now = False
+            pass_progress = 0.0
+
         los = aos + timedelta(minutes=duration_min)
-        max_elev = 38 + ((int(epoch_sec // cycle_s) * 19 + sat["norad"]) % 49)
+        orbit_num = int((epoch_sec + phase_offset) // cycle_s)
+        max_elev = 32 + ((orbit_num * 19 + sat["norad"]) % 53)
+        # Alternating ascending (S -> N, AOS Az ~165-195 S) and descending (N -> S, LOS Az ~165-195 S)
+        is_ascending = (orbit_num + idx) % 2 == 0
+        east_west_offset = ((orbit_num * 37 + sat["norad"]) % 50) - 25  # -25 to +25 deg
+        if is_ascending:
+            aos_az = (180 + east_west_offset) % 360
+            max_az = (135 if east_west_offset >= 0 else 225)
+            los_az = (360 - east_west_offset) % 360
+            direction_str = f"S→N Ascending (AOS {aos_az}° S · Peak {max_az}°)"
+            # Southern half is the FIRST half of an ascending pass (0% - 60%)
+            south_window_offset_min = 0
+            south_window_dur_min = max(5, int(duration_min * 0.6))
+            in_south_sector_now = is_active_now and (pass_progress <= 0.65)
+        else:
+            aos_az = (360 + east_west_offset) % 360
+            max_az = (145 if east_west_offset >= 0 else 215)
+            los_az = (180 - east_west_offset) % 360
+            direction_str = f"N→S Descending (Peak {max_az}° · LOS {los_az}° S)"
+            # Southern half is the SECOND half of a descending pass (35% - 100%)
+            south_window_offset_min = int(duration_min * 0.35)
+            south_window_dur_min = max(5, duration_min - south_window_offset_min)
+            in_south_sector_now = is_active_now and (pass_progress >= 0.35)
+
+        south_aos = aos + timedelta(minutes=south_window_offset_min)
+        south_favorable = max_elev >= 28 and (105 <= max_az <= 255 or 110 <= aos_az <= 250 or 110 <= los_az <= 250)
+
         passes.append(
             {
                 "satellite": sat["name"],
@@ -245,12 +284,18 @@ def compute_upcoming_wx_passes() -> list[dict]:
                 "mode": sat["mode"],
                 "aos_utc": aos.strftime("%Y-%m-%d %H:%M UTC"),
                 "los_utc": los.strftime("%H:%M UTC"),
-                "in_minutes": max(0, int(rem // 60)),
+                "south_window_utc": south_aos.strftime("%H:%M UTC") + f" ({south_window_dur_min}m S-Sky)",
+                "in_minutes": 0 if is_active_now else max(1, int(rem_s // 60)),
                 "duration_min": duration_min,
+                "south_window_dur_min": south_window_dur_min,
                 "max_elevation_deg": max_elev,
+                "trajectory": direction_str,
+                "south_favorable": south_favorable,
+                "is_active_now": is_active_now,
+                "in_south_sector_now": in_south_sector_now,
             }
         )
-    passes.sort(key=lambda x: x["in_minutes"])
+    passes.sort(key=lambda x: (0 if x["in_south_sector_now"] else 1, x["in_minutes"]))
     return passes
 
 
