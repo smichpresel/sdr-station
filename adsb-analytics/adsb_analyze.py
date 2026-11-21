@@ -16,12 +16,21 @@ import csv
 import gzip
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 
 import psycopg2
 import psycopg2.extras
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR / "sanctions-sync"))
+try:
+    from opensanctions_sync import match_aircraft_sanctions
+except Exception:
+    def match_aircraft_sanctions(hex_code=None, reg=None, callsign=None, dsn=None):
+        return None
 
 PG_DSN = os.environ.get("SDR_PG_DSN", "dbname=sdr_station")
 TAR1090_DB_DIR = Path(os.environ.get("TAR1090_DB_DIR", "/usr/local/share/tar1090/git-db/db"))
@@ -174,6 +183,16 @@ def score_interesting_aircraft(flight_row: dict, meta: dict) -> tuple[int, str, 
     max_gs = flight_row.get("max_gs") or 0.0
     min_alt = flight_row.get("min_alt")
     max_alt = flight_row.get("max_alt")
+
+    # 0. Check Live OpenSanctions Aviation Watchlist (sanctions_watchlist table)
+    os_hit = match_aircraft_sanctions(hex_code, reg, callsign)
+    if os_hit:
+        return (
+            152,
+            "sanctioned_aviation",
+            f"OpenSanctions · {os_hit['datasets'][:24]}",
+            f"{tdesc} ({reg}, flight {callsign}) — Designated on {os_hit['datasets']} ({os_hit['matched_on']}), tracked at {min_alt or '—'}–{max_alt or '—'} ft.",
+        )
 
     # 1. Check Russian / Iranian / Sanctioned operators by callsign prefix
     cs_prefix3 = callsign[:3] if callsign != "—" else ""

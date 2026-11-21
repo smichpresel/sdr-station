@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenSanctions Maritime and Aviation Watchlist Sync
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/opt/sdr-station
+EnvironmentFile=-/etc/default/sdr-station
+ExecStart=/usr/bin/python3 /opt/sdr-station/sanctions-sync/opensanctions_sync.py

@@ -34,6 +34,20 @@ import psycopg2.extras
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "adsb-analytics"))
 sys.path.insert(0, str(BASE_DIR / "ais-analytics"))
+sys.path.insert(0, str(BASE_DIR / "sanctions-sync"))
+try:
+    from opensanctions_sync import (
+        get_watchlist_cache,
+        match_vessel_sanctions,
+        sync_opensanctions,
+    )
+except Exception:
+    def get_watchlist_cache(dsn=None):
+        return {"stats": {"vessels": 0, "aircraft": 0, "total_keys": 0, "last_sync_utc": None}}
+    def match_vessel_sanctions(mmsi=None, imo=None, shipname=None, dsn=None):
+        return None
+    def sync_opensanctions(dsn=None):
+        return {"ok": False}
 try:
     from adsb_analyze import (
         build_aircraft_links,
@@ -660,6 +674,7 @@ def get_system_info() -> dict:
         "modes_status": modes_status,
         "cycler": CYCLER.status(),
         "tunnel": TUNNEL.status(),
+        "sanctions_watchlist": get_watchlist_cache()["stats"],
     }
 
 
@@ -773,7 +788,17 @@ def score_interesting_ship(v: dict) -> tuple[int, str, str, str]:
             f"{name} (MMSI {mmsi_str}, {flag_short}) — anomalous surface speed {speed} kt reported over AIS.",
         )
 
-    # 2A. Explicit OFAC / EU / UK Sanctioned Vessel Watchlist (MMSI or IMO)
+    # 2A. Live OpenSanctions Watchlist DB Match (2,000+ OFAC / EU / UK / UN designated vessels)
+    os_hit = match_vessel_sanctions(mmsi_str, imo_str, name)
+    if os_hit:
+        return (
+            158,
+            "sanctioned_vessel",
+            f"OpenSanctions · {os_hit['datasets'][:24]} ({flag_short})",
+            f"{name} (MMSI {mmsi_str}{', IMO ' + imo_str if imo_str else ''}) — Designated on {os_hit['datasets']} (matched {os_hit['matched_on']}), dest: '{dest}'.",
+        )
+
+    # 2B. Explicit Static Sanctioned Vessel Watchlist (MMSI or IMO)
     if mmsi_str in SANCTIONED_MMSI_WATCHLIST or imo_str in SANCTIONED_IMO_WATCHLIST:
         note = SANCTIONED_MMSI_WATCHLIST.get(mmsi_str) or SANCTIONED_IMO_WATCHLIST.get(imo_str)
         return (
@@ -2145,7 +2170,10 @@ HTML_PAGE = """<!DOCTYPE html>
     <aside class="panel" aria-label="Notable catches of the day">
       <div class="panel-bar">
         <span class="panel-title">Notable Catches Today</span>
-        <span class="panel-meta">Auto-ranked · Public DB links</span>
+        <div style="display:flex;align-items:center;gap:0.4rem">
+          <span class="panel-meta" id="sanctionsStatusBadge">OpenSanctions DB</span>
+          <button class="action-chip" id="btnSyncSanctions" onclick="triggerSanctionsSync()">Sync Watchlist</button>
+        </div>
       </div>
       <div class="inspector-list">
         <div class="ins-group-label">
@@ -2788,12 +2816,34 @@ async function toggleTunnel() {
   renderTunnel(data.tunnel);
 }
 
-function copyTunnelUrl() {
+async function copyTunnelUrl() {
   if (tunnelState && tunnelState.url) {
     navigator.clipboard.writeText(tunnelState.url).catch(() => {});
     const btn = document.getElementById('tunnelCopyBtn');
     btn.textContent = 'Copied';
     setTimeout(() => { btn.textContent = 'Copy URL'; }, 1500);
+  }
+}
+
+async function triggerSanctionsSync() {
+  const btn = document.getElementById('btnSyncSanctions');
+  btn.textContent = 'Syncing...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/sanctions/sync', {method: 'POST'});
+    const data = await res.json();
+    if (data.stats) {
+      document.getElementById('sanctionsStatusBadge').textContent =
+        `OpenSanctions: ${data.stats.vessels} ships · ${data.stats.aircraft} aircraft`;
+    }
+    btn.textContent = 'Synced';
+    await fetchStatus();
+    await fetchMapAndLog();
+  } catch (e) {
+    btn.textContent = 'Sync Error';
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = 'Sync Watchlist'; }, 2500);
   }
 }
 
@@ -2831,6 +2881,13 @@ async function fetchStatus() {
 
   renderTunnel(sys.tunnel);
   renderCycler(cyclerState, sys.active_mode);
+  if (sys.sanctions_watchlist) {
+    const sw = sys.sanctions_watchlist;
+    document.getElementById('sanctionsStatusBadge').textContent =
+      sw.total_keys > 0
+        ? `OpenSanctions: ${sw.vessels} ships · ${sw.aircraft} aircraft`
+        : 'OpenSanctions: Not synced';
+  }
 
   const activeName = sys.active_mode !== 'off' && modesMeta[sys.active_mode]
     ? modesMeta[sys.active_mode].title
@@ -3093,6 +3150,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
             force = qs.get("force", ["0"])[0] in ("1", "true")
             events = run_sts_detection(force=force)
             self._send_json({"count": len(events), "events": events})
+        elif parsed.path == "/api/sanctions/status":
+            self._send_json(get_watchlist_cache()["stats"])
         elif parsed.path == "/api/highlights/export.csv":
             buf = io.StringIO()
             try:
@@ -3182,6 +3241,11 @@ class LauncherHandler(BaseHTTPRequestHandler):
             else:
                 t_status = TUNNEL.stop()
             self._send_json({"ok": True, "tunnel": t_status})
+        elif parsed.path == "/api/sanctions/sync":
+            res = sync_opensanctions()
+            _STATUS_CACHE["ts"] = 0.0
+            _MAP_CACHE["ts"] = 0.0
+            self._send_json(res)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 

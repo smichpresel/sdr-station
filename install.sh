@@ -44,7 +44,7 @@ EOF
 
 mkdir -p "${REPO_DIR}/data/ais" "${REPO_DIR}/data/adsb" "${REPO_DIR}/data/ism"
 
-for svc in adsb-logger.service ais-catcher.service sdr-voice-web.service rtl-433-web.service rtl-tcp.service sdr-launcher.service; do
+for svc in adsb-logger.service ais-catcher.service sdr-voice-web.service rtl-433-web.service rtl-tcp.service sdr-launcher.service opensanctions-sync.service opensanctions-sync.timer; do
   sed -e "s|User=pi|User=${RUN_USER}|g" \
       -e "s|/opt/sdr-station|${REPO_DIR}|g" \
       -e "s|<your-lat>|${STATION_LAT}|g" \
@@ -53,5 +53,5 @@ for svc in adsb-logger.service ais-catcher.service sdr-voice-web.service rtl-433
 done
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now sdr-launcher.service adsb-logger.service
+sudo systemctl enable --now sdr-launcher.service adsb-logger.service opensanctions-sync.timer
 echo "=== Done! Open http://$(hostname -I | awk '{print $1}'):8080/ ==="
