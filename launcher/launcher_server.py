@@ -33,6 +33,7 @@ import psycopg2.extras
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "adsb-analytics"))
+sys.path.insert(0, str(BASE_DIR / "ais-analytics"))
 try:
     from adsb_analyze import (
         build_aircraft_links,
@@ -49,6 +50,14 @@ except Exception:
         return []
     def score_interesting_aircraft(f, m):
         return (0, "standard", "Flight", "")
+
+try:
+    from sts_detector import get_sts_events, run_sts_detection
+except Exception:
+    def run_sts_detection(dsn=None, force=False):
+        return []
+    def get_sts_events(dsn=None):
+        return []
 
 PORT = int(os.environ.get("LAUNCHER_PORT", "8080"))
 PG_DSN = os.environ.get("SDR_PG_DSN", "dbname=sdr_station")
@@ -2170,6 +2179,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
         <div class="segmented" role="tablist" aria-label="Dataset view">
           <button class="seg-btn active" id="tabBtnLogbook" onclick="switchTableTab('logbook')">Saved Notable Logbook</button>
+          <button class="seg-btn" id="tabBtnSts" onclick="switchTableTab('sts')">STS &amp; Loitering</button>
           <button class="seg-btn" id="tabBtnAircraft" onclick="switchTableTab('aircraft')">Recent Aircraft (adsb_flights)</button>
           <button class="seg-btn" id="tabBtnVessels" onclick="switchTableTab('vessels')">Recent Vessels (ais_state)</button>
         </div>
@@ -2228,6 +2238,7 @@ let markerIndex = {};
 let cachedMapData = {station: {}, aircraft: [], ships: [], highlights_log: []};
 let cachedAdsb = {};
 let cachedAis = {};
+let cachedSts = [];
 let currentMapFilter = 'all';
 let currentLogFilter = 'all';
 let currentTableTab = 'logbook';
@@ -2518,12 +2529,45 @@ function locateOnMap(domain, targetId, lat, lon) {
   }
 }
 
-function switchTableTab(tab) {
+async function showStsPairTracks(mmsiA, nameA, mmsiB, nameB, lat, lon) {
+  document.getElementById('mapSection').scrollIntoView({behavior: 'smooth', block: 'start'});
+  initMap();
+  trackLayerGroup.clearLayers();
+  if (lat && lon && map) {
+    map.setView([lat, lon], 13, {animate: true});
+  }
+  try {
+    const res1 = await fetch(`/api/track?domain=ship&id=${encodeURIComponent(mmsiA)}&hours=48`);
+    const d1 = await res1.json();
+    if ((d1.points || []).length >= 2) {
+      drawPolylineTrack('ship', nameA || mmsiA, d1.points, false);
+    }
+    if (mmsiB) {
+      const res2 = await fetch(`/api/track?domain=ship&id=${encodeURIComponent(mmsiB)}&hours=48`);
+      const d2 = await res2.json();
+      if ((d2.points || []).length >= 2) {
+        drawPolylineTrack('aircraft', nameB || mmsiB, d2.points, false);
+      }
+    }
+  } catch (e) {
+    console.error('STS track error:', e);
+  }
+}
+
+async function switchTableTab(tab) {
   currentTableTab = tab;
   document.getElementById('tabBtnLogbook').classList.toggle('active', tab === 'logbook');
+  document.getElementById('tabBtnSts').classList.toggle('active', tab === 'sts');
   document.getElementById('tabBtnAircraft').classList.toggle('active', tab === 'aircraft');
   document.getElementById('tabBtnVessels').classList.toggle('active', tab === 'vessels');
   document.getElementById('logSubFilters').style.display = tab === 'logbook' ? 'inline-flex' : 'none';
+  if (tab === 'sts' && cachedSts.length === 0) {
+    try {
+      const res = await fetch('/api/sts');
+      const data = await res.json();
+      cachedSts = data.events || [];
+    } catch (e) {}
+  }
   renderActiveTable();
 }
 
@@ -2596,6 +2640,47 @@ function renderActiveTable() {
           </td>
           <td class="num" style="font-size:0.73rem;color:var(--ink-muted)">${r.last_seen_utc}</td>
           <td><div style="display:flex;gap:4px;flex-wrap:wrap">${mapBtn} ${pubLinks}</div></td>
+        </tr>
+      `;
+    }).join('');
+  } else if (currentTableTab === 'sts') {
+    thead.innerHTML = `
+      <tr>
+        <th>Anomaly Type</th>
+        <th>Primary &amp; Partner Vessel</th>
+        <th>Classification</th>
+        <th>Kinematics &amp; Proximity Details</th>
+        <th>Last Seen</th>
+        <th>Actions</th>
+      </tr>
+    `;
+    const evs = (cachedSts || []).filter(e => {
+      if (!q) return true;
+      return `${e.primary_name} ${e.primary_mmsi} ${e.secondary_name || ''} ${e.secondary_mmsi || ''} ${e.badge} ${e.summary}`.toLowerCase().includes(q);
+    });
+    document.getElementById('logbookCountLabel').textContent = `${evs.length} STS & loitering events`;
+    if (evs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--ink-muted)">No STS rendezvous or offshore loitering events matching filter.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = evs.map(e => {
+      const typeLabel = e.event_type === 'sts_transfer' ? 'STS Rendezvous' : 'Offshore Loitering';
+      const title = e.secondary_name ? `${e.primary_name} ↔ ${e.secondary_name}` : e.primary_name;
+      const subId = e.secondary_mmsi ? `MMSI ${e.primary_mmsi} / ${e.secondary_mmsi}` : `MMSI ${e.primary_mmsi}`;
+      const pNameClean = String(e.primary_name || '').replace(/'/g, "");
+      const sNameClean = String(e.secondary_name || '').replace(/'/g, "");
+      const traceBtn = `<button class="action-chip locate" onclick="showStsPairTracks('${e.primary_mmsi}', '${pNameClean}', '${e.secondary_mmsi || ''}', '${sNameClean}', ${e.lat || 'null'}, ${e.lon || 'null'})">Locate &amp; Draw Trails</button>`;
+      return `
+        <tr>
+          <td class="num" style="color:var(--signal-amber)">${typeLabel}</td>
+          <td>
+            <div class="num" style="font-weight:600;color:var(--ink-strong)">${title}</div>
+            <div class="num" style="font-size:0.7rem;color:var(--ink-faint)">${subId}</div>
+          </td>
+          <td><span class="tag-spec">${e.badge}</span></td>
+          <td>${e.summary}</td>
+          <td class="num" style="font-size:0.73rem;color:var(--ink-muted)">${e.last_seen_utc}</td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap">${traceBtn}</div></td>
         </tr>
       `;
     }).join('');
@@ -3003,6 +3088,11 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self._send_json(get_target_track(domain, target_id, hours=hours))
         elif parsed.path == "/api/tracks/notable":
             self._send_json(get_notable_tracks(max_targets=14))
+        elif parsed.path == "/api/sts":
+            qs = parse_qs(parsed.query)
+            force = qs.get("force", ["0"])[0] in ("1", "true")
+            events = run_sts_detection(force=force)
+            self._send_json({"count": len(events), "events": events})
         elif parsed.path == "/api/highlights/export.csv":
             buf = io.StringIO()
             try:
